@@ -1,7 +1,7 @@
 use clap::{command, Arg};
-use std::io;
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> Result<(), reqwest::Error> {
     let matches = command!()
         .about("Recursively search the web, starting from URI..., for PHRASE")
         .arg(
@@ -17,11 +17,12 @@ fn main() -> io::Result<()> {
         )
         .get_matches();
 
-    println!("{}", matches.value_of("PHRASE").unwrap());
-    println!(
-        "{:?}",
-        matches.values_of("URI").unwrap().collect::<Vec<_>>()
-    );
+    let phrase = matches.value_of("PHRASE").unwrap();
+
+    for u in matches.values_of("URI").unwrap() {
+        let body = reqwest::get(u).await?.text().await?;
+        println!("{}", body.contains(phrase));
+    }
 
     Ok(())
 }
