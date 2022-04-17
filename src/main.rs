@@ -25,8 +25,12 @@ async fn main() -> Result<(), reqwest::Error> {
 
     for u_ in matches.values_of("URI").unwrap() {
         let u: Url = u_.parse().unwrap();
-        // TODO: sleep between requests,
-        // see `tokio::time::delay_for`.
+        // Making web requests
+        // at the speed of a computer
+        // can have negative repercussions,
+        // like IP banning.
+        // TODO: sleep based on time since last request to this domain.
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         let dom = html5ever::parse_document(RcDom::default(), Default::default())
             .from_utf8()
             .read_from(&mut reqwest::get(u.as_ref()).await?.text().await?.as_bytes())
@@ -48,7 +52,7 @@ async fn main() -> Result<(), reqwest::Error> {
 // TODO: deduplicate links,
 // maybe return a set.
 fn links(origin: &Url, dom: &RcDom) -> Vec<Url> {
-    fn walk(origin: &Url, links: &mut Vec<Url>, handle: &Handle) -> () {
+    fn walk(origin: &Url, links: &mut Vec<Url>, handle: &Handle) {
         match handle.data {
             NodeData::Element {
                 ref name,
