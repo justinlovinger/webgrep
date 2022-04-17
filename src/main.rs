@@ -1,6 +1,7 @@
 use clap::{command, Arg};
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
+use reqwest::Url;
 use std::default::Default;
 
 #[tokio::main]
@@ -22,21 +23,32 @@ async fn main() -> Result<(), reqwest::Error> {
 
     let phrase = matches.value_of("PHRASE").unwrap();
 
-    for u in matches.values_of("URI").unwrap() {
+    for u_ in matches.values_of("URI").unwrap() {
+        let u: Url = u_.parse().unwrap();
         // TODO: sleep between requests,
         // see `tokio::time::delay_for`.
         let dom = html5ever::parse_document(RcDom::default(), Default::default())
             .from_utf8()
-            .read_from(&mut reqwest::get(u).await?.text().await?.as_bytes())
+            .read_from(&mut reqwest::get(u.as_ref()).await?.text().await?.as_bytes())
             .unwrap();
-        println!("{:?}", links(u, &dom));
+        println!(
+            "{:?}",
+            links(&u, &dom)
+                .iter()
+                .map(|x| x.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     Ok(())
 }
 
-fn links(origin: &str, dom: &RcDom) -> Vec<String> {
-    fn walk(links: &mut Vec<String>, handle: &Handle) -> () {
+// fn parse_page(...) -> (links, lines)
+
+// TODO: deduplicate links,
+// maybe return a set.
+fn links(origin: &Url, dom: &RcDom) -> Vec<Url> {
+    fn walk(origin: &Url, links: &mut Vec<Url>, handle: &Handle) -> () {
         match handle.data {
             NodeData::Element {
                 ref name,
@@ -49,17 +61,18 @@ fn links(origin: &str, dom: &RcDom) -> Vec<String> {
                         .iter()
                         .filter(|x| x.name.local.as_ref() == "href")
                         .take(1) // An `a` tag shouldn't have more than one `href`
-                        .for_each(|x| links.push(x.value.to_string()));
+                        .filter_map(|x| origin.join(&x.value).ok())
+                        .for_each(|x| links.push(x));
                 }
             }
             _ => {}
         }
         for child in handle.children.borrow().iter() {
-            walk(links, child);
+            walk(origin, links, child);
         }
     }
 
     let mut xs = Vec::new();
-    walk(&mut xs, &dom.document);
+    walk(origin, &mut xs, &dom.document);
     xs
 }
