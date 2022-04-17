@@ -51,10 +51,20 @@ fn inner_text(dom: &RcDom) -> String {
             NodeData::Text { ref contents } => {
                 text.push_str(contents.borrow().to_string().as_str());
             }
-            _ => {}
-        }
-        for child in handle.children.borrow().iter() {
-            walk(text, child);
+            NodeData::Element { ref name, .. } => {
+                // The contents of script tags are invisible,
+                // and shouldn't be searched.
+                if name.local.as_ref() != "script" {
+                    for child in handle.children.borrow().iter() {
+                        walk(text, child);
+                    }
+                }
+            }
+            _ => {
+                for child in handle.children.borrow().iter() {
+                    walk(text, child);
+                }
+            }
         }
     }
 
