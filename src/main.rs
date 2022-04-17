@@ -2,6 +2,7 @@ use clap::{command, Arg};
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use reqwest::Url;
+use std::collections::VecDeque;
 use std::default::Default;
 
 #[tokio::main]
@@ -23,24 +24,34 @@ async fn main() -> Result<(), reqwest::Error> {
 
     let phrase = matches.value_of("PHRASE").unwrap();
 
-    for u_ in matches.values_of("URI").unwrap() {
-        let u: Url = u_.parse().unwrap();
-        // Making web requests
-        // at the speed of a computer
-        // can have negative repercussions,
-        // like IP banning.
-        // TODO: sleep based on time since last request to this domain.
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        let dom = html5ever::parse_document(RcDom::default(), Default::default())
-            .from_utf8()
-            .read_from(&mut reqwest::get(u.as_ref()).await?.text().await?.as_bytes())
-            .unwrap();
-        if inner_text(&dom).contains(phrase) {
-            println!("{}", u);
+    let mut xs: VecDeque<Url> = matches
+        .values_of("URI")
+        .unwrap()
+        .map(|x| x.parse().unwrap())
+        .collect();
+    loop {
+        match xs.pop_front() {
+            Some(u) => {
+                // Making web requests
+                // at the speed of a computer
+                // can have negative repercussions,
+                // like IP banning.
+                // TODO: sleep based on time since last request to this domain.
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let dom = html5ever::parse_document(RcDom::default(), Default::default())
+                    .from_utf8()
+                    .read_from(&mut reqwest::get(u.as_ref()).await?.text().await?.as_bytes())
+                    .unwrap();
+                if inner_text(&dom).contains(phrase) {
+                    println!("{}", u);
+                }
+                for x in links(&u, &dom) {
+                    xs.push_front(x);
+                }
+            }
+            None => return Ok(()),
         }
     }
-
-    Ok(())
 }
 
 // fn parse_page(body: String) -> (links, lines)
