@@ -35,19 +35,33 @@ async fn main() -> Result<(), reqwest::Error> {
             .from_utf8()
             .read_from(&mut reqwest::get(u.as_ref()).await?.text().await?.as_bytes())
             .unwrap();
-        println!(
-            "{:?}",
-            links(&u, &dom)
-                .iter()
-                .map(|x| x.as_str())
-                .collect::<Vec<_>>()
-        );
+        if inner_text(&dom).contains(phrase) {
+            println!("{}", u);
+        }
     }
 
     Ok(())
 }
 
-// fn parse_page(...) -> (links, lines)
+// fn parse_page(body: String) -> (links, lines)
+
+fn inner_text(dom: &RcDom) -> String {
+    fn walk(text: &mut String, handle: &Handle) {
+        match handle.data {
+            NodeData::Text { ref contents } => {
+                text.push_str(contents.borrow().to_string().as_str());
+            }
+            _ => {}
+        }
+        for child in handle.children.borrow().iter() {
+            walk(text, child);
+        }
+    }
+
+    let mut text = String::new();
+    walk(&mut text, &dom.document);
+    text
+}
 
 // TODO: deduplicate links,
 // maybe return a set.
