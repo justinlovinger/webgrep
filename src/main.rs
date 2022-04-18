@@ -4,7 +4,11 @@ use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use reqwest::Url;
 use std::collections::HashSet;
 use std::default::Default;
+use std::io;
+use std::io::Write;
 use std::rc::Rc;
+
+const CLEAR_CODE: &[u8] = b"\r\x1B[K";
 
 pub struct Node<T> {
     parent: Option<Rc<Node<T>>>,
@@ -88,9 +92,17 @@ async fn main() -> Result<(), reqwest::Error> {
         .unwrap()
         .map(|x| Node::new(None, x.parse().unwrap()))
         .collect();
+    let mut werr = io::BufWriter::new(io::stderr());
     loop {
         match xs.pop() {
             Some(x) => {
+                // Search may spend a long time between matches,
+                // but we don't want to clutter output
+                // with every URL.
+                let _ = werr.write_all(CLEAR_CODE);
+                let _ = werr.write_all(x.value.as_str().as_bytes());
+                let _ = werr.flush();
+
                 // Making web requests
                 // at the speed of a computer
                 // can have negative repercussions,
@@ -107,7 +119,10 @@ async fn main() -> Result<(), reqwest::Error> {
                             .as_bytes(),
                     )
                     .unwrap();
+
                 if inner_text(&dom).contains(phrase) {
+                    let _ = werr.write_all(CLEAR_CODE);
+                    let _ = werr.flush();
                     // `map(...).intersperse(" > ")` would be better,
                     // but it is only available in nightly builds
                     // as of 2022-04-18.
@@ -120,6 +135,7 @@ async fn main() -> Result<(), reqwest::Error> {
                             .join(" > ")
                     );
                 }
+
                 if x.depth() < max_depth {
                     let rcx = Rc::new(x);
                     // We don't need to know if a path cycles back on itself.
