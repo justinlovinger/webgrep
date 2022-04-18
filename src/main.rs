@@ -122,10 +122,10 @@ fn inner_text(dom: &RcDom) -> String {
     text
 }
 
-// TODO: deduplicate links,
-// maybe return a set.
-fn links(origin: &Url, dom: &RcDom) -> Vec<Url> {
-    let mut xs = Vec::new();
+// We only want unique links.
+// `HashSet` takes care of this.
+fn links(origin: &Url, dom: &RcDom) -> HashSet<Url> {
+    let mut xs = HashSet::new();
     walk_dom(
         &mut |data| {
             match data {
@@ -141,7 +141,10 @@ fn links(origin: &Url, dom: &RcDom) -> Vec<Url> {
                             .filter(|x| x.name.local.as_ref() == "href")
                             .take(1) // An `a` tag shouldn't have more than one `href`
                             .filter_map(|x| origin.join(&x.value).ok())
-                            .for_each(|x| xs.push(x));
+                            .for_each(|x| {
+                                xs.insert(x);
+                                ()
+                            });
                     }
                 }
                 _ => {}
