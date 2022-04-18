@@ -3,7 +3,6 @@ use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use reqwest::Url;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::default::Default;
 use std::iter;
 use std::rc::Rc;
@@ -45,16 +44,13 @@ async fn main() -> Result<(), reqwest::Error> {
 
     let phrase = matches.value_of("PHRASE").unwrap();
 
-    // TODO: replace `VecDeque` with `Vec`,
-    // push to the back,
-    // and pop from the back.
-    let mut xs: VecDeque<Node<Url>> = matches
+    let mut xs: Vec<Node<Url>> = matches
         .values_of("URI")
         .unwrap()
         .map(|x| Node::new(None, x.parse().unwrap()))
         .collect();
     loop {
-        match xs.pop_front() {
+        match xs.pop() {
             Some(x) => {
                 // Making web requests
                 // at the speed of a computer
@@ -83,7 +79,7 @@ async fn main() -> Result<(), reqwest::Error> {
                 links(&rcx.value, &dom)
                     .into_iter()
                     .filter(|u| !xpath.contains(&u))
-                    .for_each(|u| xs.push_front(Node::new(Some(rcx.clone()), u)));
+                    .for_each(|u| xs.push(Node::new(Some(rcx.clone()), u)));
             }
             None => return Ok(()),
         }
