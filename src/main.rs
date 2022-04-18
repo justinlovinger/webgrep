@@ -4,6 +4,29 @@ use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use reqwest::Url;
 use std::collections::VecDeque;
 use std::default::Default;
+use std::rc::Rc;
+
+struct Node<T> {
+    parent: Option<Rc<Node<T>>>,
+    value: T,
+}
+
+impl<T> Node<T> {
+    pub fn new(parent: Option<Rc<Node<T>>>, value: T) -> Self {
+        Node { parent, value }
+    }
+
+    pub fn path(&self) -> Vec<&T> {
+        match &self.parent {
+            Some(p) => {
+                let mut xs = p.path();
+                xs.push(&self.value);
+                xs
+            }
+            None => Vec::new(),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), reqwest::Error> {
@@ -24,14 +47,17 @@ async fn main() -> Result<(), reqwest::Error> {
 
     let phrase = matches.value_of("PHRASE").unwrap();
 
-    let mut xs: VecDeque<Url> = matches
+    // TODO: replace `VecDeque` with `Vec`,
+    // push to the back,
+    // and pop from the back.
+    let mut xs: VecDeque<Node<Url>> = matches
         .values_of("URI")
         .unwrap()
-        .map(|x| x.parse().unwrap())
+        .map(|x| Node::new(None, x.parse().unwrap()))
         .collect();
     loop {
         match xs.pop_front() {
-            Some(u) => {
+            Some(x) => {
                 // Making web requests
                 // at the speed of a computer
                 // can have negative repercussions,
@@ -40,14 +66,26 @@ async fn main() -> Result<(), reqwest::Error> {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 let dom = html5ever::parse_document(RcDom::default(), Default::default())
                     .from_utf8()
-                    .read_from(&mut reqwest::get(u.as_ref()).await?.text().await?.as_bytes())
+                    .read_from(
+                        &mut reqwest::get(x.value.as_ref())
+                            .await?
+                            .text()
+                            .await?
+                            .as_bytes(),
+                    )
                     .unwrap();
                 if inner_text(&dom).contains(phrase) {
-                    println!("{}", u);
+                    println!("{}", x.value);
                 }
-                for x in links(&u, &dom) {
-                    xs.push_front(x);
-                }
+                let rcx = Rc::new(x);
+                // We don't need to know if a path cycles back on itself.
+                // For us,
+                // path cycles waste time and lead to infinite loops.
+                let xpath = rcx.path();
+                links(&rcx.value, &dom)
+                    .into_iter()
+                    .filter(|u| !xpath.contains(&u))
+                    .for_each(|u| xs.push_front(Node::new(Some(rcx.clone()), u)));
             }
             None => return Ok(()),
         }
