@@ -4,25 +4,39 @@ use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use reqwest::Url;
 use std::collections::HashSet;
 use std::default::Default;
-use std::iter;
 use std::rc::Rc;
 
-struct Node<T> {
+pub struct Node<T> {
     parent: Option<Rc<Node<T>>>,
     value: T,
+}
+
+pub struct NodePathIterator<'a, T> {
+    node: Option<&'a Rc<Node<T>>>,
+}
+
+impl<'a, T> Iterator for NodePathIterator<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.node {
+            Some(x) => {
+                self.node = x.parent.as_ref();
+                Some(&x.value)
+            }
+            None => None,
+        }
+    }
 }
 
 impl<T> Node<T> {
     pub fn new(parent: Option<Rc<Node<T>>>, value: T) -> Self {
         Node { parent, value }
     }
+}
 
-    pub fn path<'a>(&'a self) -> Box<dyn Iterator<Item = &'a T> + 'a> {
-        match &self.parent {
-            Some(p) => Box::new(p.path().chain(iter::once(&self.value))),
-            None => Box::new(iter::empty()),
-        }
-    }
+pub fn path_to_root<T>(x: &Rc<Node<T>>) -> NodePathIterator<T> {
+    NodePathIterator { node: Some(x) }
 }
 
 #[tokio::main]
@@ -75,7 +89,7 @@ async fn main() -> Result<(), reqwest::Error> {
                 // We don't need to know if a path cycles back on itself.
                 // For us,
                 // path cycles waste time and lead to infinite loops.
-                let xpath: HashSet<_> = rcx.path().collect();
+                let xpath: HashSet<_> = path_to_root(&rcx).collect();
                 links(&rcx.value, &dom)
                     .into_iter()
                     .filter(|u| !xpath.contains(&u))
