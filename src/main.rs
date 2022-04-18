@@ -2,8 +2,10 @@ use clap::{command, Arg};
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use reqwest::Url;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::default::Default;
+use std::iter;
 use std::rc::Rc;
 
 struct Node<T> {
@@ -16,14 +18,10 @@ impl<T> Node<T> {
         Node { parent, value }
     }
 
-    pub fn path(&self) -> Vec<&T> {
+    pub fn path<'a>(&'a self) -> Box<dyn Iterator<Item = &'a T> + 'a> {
         match &self.parent {
-            Some(p) => {
-                let mut xs = p.path();
-                xs.push(&self.value);
-                xs
-            }
-            None => Vec::new(),
+            Some(p) => Box::new(p.path().chain(iter::once(&self.value))),
+            None => Box::new(iter::empty()),
         }
     }
 }
@@ -81,7 +79,7 @@ async fn main() -> Result<(), reqwest::Error> {
                 // We don't need to know if a path cycles back on itself.
                 // For us,
                 // path cycles waste time and lead to infinite loops.
-                let xpath = rcx.path();
+                let xpath: HashSet<_> = rcx.path().collect();
                 links(&rcx.value, &dom)
                     .into_iter()
                     .filter(|u| !xpath.contains(&u))
