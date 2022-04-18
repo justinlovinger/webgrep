@@ -29,6 +29,13 @@ impl<T> Node<T> {
     pub fn new(parent: Option<Rc<Node<T>>>, value: T) -> Self {
         Node { parent, value }
     }
+
+    pub fn depth(&self) -> u64 {
+        match &self.parent {
+            Some(p) => p.depth() + 1,
+            None => 0,
+        }
+    }
 }
 
 pub fn path_to_root<T>(x: &Rc<Node<T>>) -> NodePathIterator<T> {
@@ -40,22 +47,33 @@ async fn main() -> Result<(), reqwest::Error> {
     let matches = command!()
         .about("Recursively search the web, starting from URI..., for PHRASE")
         .arg(
-            Arg::new("PHRASE")
+            Arg::new("phrase")
                 .required(true)
+                .value_name("PHRASE")
                 .help("Phrase to search for"),
         )
         .arg(
-            Arg::new("URI")
+            Arg::new("uri")
                 .multiple_occurrences(true)
                 .required(true)
+                .value_name("URI")
                 .help("URIs to start search from"),
+        )
+        .arg(
+            Arg::new("depth")
+                .short('d')
+                .long("max-depth")
+                .default_value("1")
+                .value_name("NUM")
+                .help("Limit search depth to NUM links from starting URI"),
         )
         .get_matches();
 
-    let phrase = matches.value_of("PHRASE").unwrap();
+    let phrase = matches.value_of("phrase").unwrap();
+    let max_depth = matches.value_of("depth").unwrap().parse().unwrap();
 
     let mut xs: Vec<Node<Url>> = matches
-        .values_of("URI")
+        .values_of("uri")
         .unwrap()
         .map(|x| Node::new(None, x.parse().unwrap()))
         .collect();
@@ -81,15 +99,17 @@ async fn main() -> Result<(), reqwest::Error> {
                 if inner_text(&dom).contains(phrase) {
                     println!("{}", x.value);
                 }
-                let rcx = Rc::new(x);
-                // We don't need to know if a path cycles back on itself.
-                // For us,
-                // path cycles waste time and lead to infinite loops.
-                let xpath: HashSet<_> = path_to_root(&rcx).collect();
-                links(&rcx.value, &dom)
-                    .into_iter()
-                    .filter(|u| !xpath.contains(&u))
-                    .for_each(|u| xs.push(Node::new(Some(rcx.clone()), u)));
+                if x.depth() < max_depth {
+                    let rcx = Rc::new(x);
+                    // We don't need to know if a path cycles back on itself.
+                    // For us,
+                    // path cycles waste time and lead to infinite loops.
+                    let xpath: HashSet<_> = path_to_root(&rcx).collect();
+                    links(&rcx.value, &dom)
+                        .into_iter()
+                        .filter(|u| !xpath.contains(&u))
+                        .for_each(|u| xs.push(Node::new(Some(rcx.clone()), u)));
+                }
             }
             None => return Ok(()),
         }
