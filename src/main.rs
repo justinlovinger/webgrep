@@ -99,8 +99,20 @@ async fn main() -> Result<(), reqwest::Error> {
                 // Search may spend a long time between matches,
                 // but we don't want to clutter output
                 // with every URL.
+                // Overflowing terminal width
+                // may prevent clearing the line.
                 let _ = werr.write_all(CLEAR_CODE);
-                let _ = werr.write_all(x.value.as_str().as_bytes());
+                let _ = match terminal_size::terminal_size() {
+                    Some((terminal_size::Width(w), _)) => {
+                        let s = x.value.as_str().as_bytes();
+                        // Slice is safe
+                        // because the string will never be longer than itself.
+                        werr.write_all(unsafe {
+                            s.get_unchecked(..std::cmp::min(s.len(), w.into()))
+                        })
+                    }
+                    None => werr.write_all(x.value.as_str().as_bytes()),
+                };
                 let _ = werr.flush();
 
                 // Making web requests
