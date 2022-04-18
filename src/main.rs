@@ -19,13 +19,9 @@ impl<'a, T> Iterator for NodePathIterator<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.node {
-            Some(x) => {
-                self.node = x.parent.as_ref();
-                Some(&x.value)
-            }
-            None => None,
-        }
+        let x = self.node?;
+        self.node = x.parent.as_ref();
+        Some(&x.value)
     }
 }
 
