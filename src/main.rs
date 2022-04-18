@@ -36,6 +36,17 @@ impl<T> Node<T> {
             None => 0,
         }
     }
+
+    pub fn path_from_root(&self) -> Vec<&T> {
+        match &self.parent {
+            Some(p) => {
+                let mut xs = p.path_from_root();
+                xs.push(&self.value);
+                xs
+            }
+            None => Vec::from([&self.value]),
+        }
+    }
 }
 
 pub fn path_to_root<T>(x: &Rc<Node<T>>) -> NodePathIterator<T> {
@@ -97,7 +108,17 @@ async fn main() -> Result<(), reqwest::Error> {
                     )
                     .unwrap();
                 if inner_text(&dom).contains(phrase) {
-                    println!("{}", x.value);
+                    // `map(...).intersperse(" > ")` would be better,
+                    // but it is only available in nightly builds
+                    // as of 2022-04-18.
+                    println!(
+                        "{}",
+                        x.path_from_root()
+                            .iter()
+                            .map(|u| u.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" > ")
+                    );
                 }
                 if x.depth() < max_depth {
                     let rcx = Rc::new(x);
