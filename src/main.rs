@@ -93,6 +93,7 @@ async fn main() -> Result<(), reqwest::Error> {
         .map(|x| Node::new(None, x.parse().unwrap()))
         .collect();
     let mut werr = io::BufWriter::new(io::stderr());
+    let client = Client::new();
     loop {
         match xs.pop() {
             Some(x) => {
@@ -115,21 +116,9 @@ async fn main() -> Result<(), reqwest::Error> {
                 };
                 let _ = werr.flush();
 
-                // Making web requests
-                // at the speed of a computer
-                // can have negative repercussions,
-                // like IP banning.
-                // TODO: sleep based on time since last request to this domain.
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 let dom = html5ever::parse_document(RcDom::default(), Default::default())
                     .from_utf8()
-                    .read_from(
-                        &mut reqwest::get(x.value.as_ref())
-                            .await?
-                            .text()
-                            .await?
-                            .as_bytes(),
-                    )
+                    .read_from(&mut client.get(&x.value).await.unwrap().as_bytes())
                     .unwrap();
 
                 if inner_text(&dom).contains(phrase) {
@@ -165,7 +154,27 @@ async fn main() -> Result<(), reqwest::Error> {
     }
 }
 
-// fn parse_page(body: String) -> (links, lines)
+struct Client {
+    client: reqwest::Client,
+}
+
+impl Client {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub async fn get(&self, u: &Url) -> reqwest::Result<String> {
+        // Making web requests
+        // at the speed of a computer
+        // can have negative repercussions,
+        // like IP banning.
+        // TODO: sleep based on time since last request to this domain.
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        self.client.get(u.as_ref()).send().await?.text().await
+    }
+}
 
 fn inner_text(dom: &RcDom) -> String {
     let mut text = String::new();
