@@ -2,10 +2,13 @@ use clap::{command, Arg};
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use reqwest::Url;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::default::Default;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 const CLEAR_CODE: &[u8] = b"\r\x1B[K";
@@ -156,23 +159,76 @@ async fn main() -> Result<(), reqwest::Error> {
 
 struct Client {
     client: reqwest::Client,
+    cache_dir: PathBuf,
 }
+
+type SerializableResponse = Result<String, String>;
 
 impl Client {
     pub fn new() -> Self {
+        let cache_dir = std::env::var("XDG_CACHE_HOME")
+            .map_or(
+                Path::new(std::env::var("HOME").unwrap().as_str()).join(".cache"),
+                PathBuf::from,
+            )
+            .join("web-grep");
+        std::fs::create_dir_all(&cache_dir).unwrap();
         Self {
             client: reqwest::Client::new(),
+            cache_dir,
         }
     }
 
-    pub async fn get(&self, u: &Url) -> reqwest::Result<String> {
+    pub async fn get(&self, u: &Url) -> Option<String> {
+        match self.get_from_cache(u) {
+            Some(x) => Some(x),
+            None => self.get_and_cache_from_web(u).await,
+        }
+    }
+
+    fn get_from_cache(&self, u: &Url) -> Option<String> {
+        bincode::deserialize_from(io::BufReader::new(
+            std::fs::File::open(self.cache_path(u)).ok()?,
+        ))
+        .map(|x: SerializableResponse| x.ok())
+        .ok()
+        .flatten()
+    }
+
+    async fn get_and_cache_from_web(&self, u: &Url) -> Option<String> {
         // Making web requests
         // at the speed of a computer
         // can have negative repercussions,
         // like IP banning.
         // TODO: sleep based on time since last request to this domain.
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        self.client.get(u.as_ref()).send().await?.text().await
+
+        // The type we serialize must match what is expected by `get_from_cache`.
+        let body: SerializableResponse = match self.client.get(u.as_ref()).send().await {
+            Ok(x) => x.text().await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+
+        bincode::serialize_into(
+            io::BufWriter::new(std::fs::File::create(self.cache_path(u)).unwrap()),
+            &body,
+        )
+        .unwrap();
+
+        body.ok()
+    }
+
+    fn cache_path(&self, u: &Url) -> PathBuf {
+        let mut filename = u.host_str().unwrap_or("nohost").to_owned();
+        filename.push('-');
+        filename.push_str(self.url_hash(u).to_string().as_str());
+        self.cache_dir.join(filename)
+    }
+
+    fn url_hash(&self, u: &Url) -> u64 {
+        let mut s = DefaultHasher::new();
+        u.hash(&mut s);
+        s.finish()
     }
 }
 
@@ -221,7 +277,6 @@ fn links(origin: &Url, dom: &RcDom) -> HashSet<Url> {
                             .filter_map(|x| origin.join(&x.value).ok())
                             .for_each(|x| {
                                 xs.insert(x);
-                                ()
                             });
                     }
                 }
