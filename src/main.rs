@@ -119,37 +119,47 @@ async fn main() -> Result<(), reqwest::Error> {
                 };
                 let _ = werr.flush();
 
-                let dom = html5ever::parse_document(RcDom::default(), Default::default())
-                    .from_utf8()
-                    .read_from(&mut client.get(&x.value).await.unwrap().as_bytes())
-                    .unwrap();
+                match client
+                    .get(&x.value)
+                    .await
+                    .map(|body| {
+                        html5ever::parse_document(RcDom::default(), Default::default())
+                            .from_utf8()
+                            .read_from(&mut body.as_bytes())
+                            .ok()
+                    })
+                    .flatten()
+                {
+                    Some(dom) => {
+                        if inner_text(&dom).contains(phrase) {
+                            let _ = werr.write_all(CLEAR_CODE);
+                            let _ = werr.flush();
+                            // `map(...).intersperse(" > ")` would be better,
+                            // but it is only available in nightly builds
+                            // as of 2022-04-18.
+                            println!(
+                                "{}",
+                                x.path_from_root()
+                                    .iter()
+                                    .map(|u| u.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" > ")
+                            );
+                        }
 
-                if inner_text(&dom).contains(phrase) {
-                    let _ = werr.write_all(CLEAR_CODE);
-                    let _ = werr.flush();
-                    // `map(...).intersperse(" > ")` would be better,
-                    // but it is only available in nightly builds
-                    // as of 2022-04-18.
-                    println!(
-                        "{}",
-                        x.path_from_root()
-                            .iter()
-                            .map(|u| u.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" > ")
-                    );
-                }
-
-                if x.depth() < max_depth {
-                    let rcx = Rc::new(x);
-                    // We don't need to know if a path cycles back on itself.
-                    // For us,
-                    // path cycles waste time and lead to infinite loops.
-                    let xpath: HashSet<_> = path_to_root(&rcx).collect();
-                    links(&rcx.value, &dom)
-                        .into_iter()
-                        .filter(|u| !xpath.contains(&u))
-                        .for_each(|u| xs.push(Node::new(Some(rcx.clone()), u)));
+                        if x.depth() < max_depth {
+                            let rcx = Rc::new(x);
+                            // We don't need to know if a path cycles back on itself.
+                            // For us,
+                            // path cycles waste time and lead to infinite loops.
+                            let xpath: HashSet<_> = path_to_root(&rcx).collect();
+                            links(&rcx.value, &dom)
+                                .into_iter()
+                                .filter(|u| !xpath.contains(&u))
+                                .for_each(|u| xs.push(Node::new(Some(rcx.clone()), u)));
+                        }
+                    }
+                    None => {}
                 }
             }
             None => return Ok(()),
