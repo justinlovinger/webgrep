@@ -191,21 +191,20 @@ impl Client {
 
     pub async fn get(&self, u: &Url) -> Option<String> {
         match self.get_from_cache(u) {
-            Some(x) => Some(x),
+            Some(x) => x,
             None => self.get_and_cache_from_web(u).await,
         }
+        .ok()
     }
 
-    fn get_from_cache(&self, u: &Url) -> Option<String> {
+    fn get_from_cache(&self, u: &Url) -> Option<SerializableResponse> {
         bincode::deserialize_from(io::BufReader::new(
             std::fs::File::open(self.cache_path(u)).ok()?,
         ))
-        .map(|x: SerializableResponse| x.ok())
         .ok()
-        .flatten()
     }
 
-    async fn get_and_cache_from_web(&self, u: &Url) -> Option<String> {
+    async fn get_and_cache_from_web(&self, u: &Url) -> SerializableResponse {
         // Making web requests
         // at the speed of a computer
         // can have negative repercussions,
@@ -225,7 +224,7 @@ impl Client {
         )
         .unwrap();
 
-        body.ok()
+        body
     }
 
     fn cache_path(&self, u: &Url) -> PathBuf {
