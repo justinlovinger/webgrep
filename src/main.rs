@@ -184,7 +184,10 @@ impl Client {
             .join("web-grep");
         std::fs::create_dir_all(&cache_dir).unwrap();
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(core::time::Duration::from_secs(60))
+                .build()
+                .unwrap(),
             cache_dir,
         }
     }
