@@ -119,47 +119,39 @@ async fn main() -> Result<(), reqwest::Error> {
                 };
                 let _ = werr.flush();
 
-                match client
-                    .get(&x.value)
-                    .await
-                    .map(|body| {
-                        html5ever::parse_document(RcDom::default(), Default::default())
-                            .from_utf8()
-                            .read_from(&mut body.as_bytes())
-                            .ok()
-                    })
-                    .flatten()
-                {
-                    Some(dom) => {
-                        if inner_text(&dom).contains(phrase) {
-                            let _ = werr.write_all(CLEAR_CODE);
-                            let _ = werr.flush();
-                            // `map(...).intersperse(" > ")` would be better,
-                            // but it is only available in nightly builds
-                            // as of 2022-04-18.
-                            println!(
-                                "{}",
-                                x.path_from_root()
-                                    .iter()
-                                    .map(|u| u.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" > ")
-                            );
-                        }
-
-                        if x.depth() < max_depth {
-                            let rcx = Rc::new(x);
-                            // We don't need to know if a path cycles back on itself.
-                            // For us,
-                            // path cycles waste time and lead to infinite loops.
-                            let xpath: HashSet<_> = path_to_root(&rcx).collect();
-                            links(&rcx.value, &dom)
-                                .into_iter()
-                                .filter(|u| !xpath.contains(&u))
-                                .for_each(|u| xs.push(Node::new(Some(rcx.clone()), u)));
-                        }
+                if let Some(dom) = client.get(&x.value).await.and_then(|body| {
+                    html5ever::parse_document(RcDom::default(), Default::default())
+                        .from_utf8()
+                        .read_from(&mut body.as_bytes())
+                        .ok()
+                }) {
+                    if inner_text(&dom).contains(phrase) {
+                        let _ = werr.write_all(CLEAR_CODE);
+                        let _ = werr.flush();
+                        // `map(...).intersperse(" > ")` would be better,
+                        // but it is only available in nightly builds
+                        // as of 2022-04-18.
+                        println!(
+                            "{}",
+                            x.path_from_root()
+                                .iter()
+                                .map(|u| u.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" > ")
+                        );
                     }
-                    None => {}
+
+                    if x.depth() < max_depth {
+                        let rcx = Rc::new(x);
+                        // We don't need to know if a path cycles back on itself.
+                        // For us,
+                        // path cycles waste time and lead to infinite loops.
+                        let xpath: HashSet<_> = path_to_root(&rcx).collect();
+                        links(&rcx.value, &dom)
+                            .into_iter()
+                            .filter(|u| !xpath.contains(&u))
+                            .for_each(|u| xs.push(Node::new(Some(rcx.clone()), u)));
+                    }
                 }
             }
             None => return Ok(()),
@@ -276,25 +268,23 @@ fn links(origin: &Url, dom: &RcDom) -> HashSet<Url> {
     let mut xs = HashSet::new();
     walk_dom(
         &mut |data| {
-            match data {
-                NodeData::Element {
-                    ref name,
-                    ref attrs,
-                    ..
-                } => {
-                    if name.local.as_ref() == "a" {
-                        attrs
-                            .borrow()
-                            .iter()
-                            .filter(|x| x.name.local.as_ref() == "href")
-                            .take(1) // An `a` tag shouldn't have more than one `href`
-                            .filter_map(|x| origin.join(&x.value).ok())
-                            .for_each(|x| {
-                                xs.insert(x);
-                            });
-                    }
+            if let NodeData::Element {
+                ref name,
+                ref attrs,
+                ..
+            } = data
+            {
+                if name.local.as_ref() == "a" {
+                    attrs
+                        .borrow()
+                        .iter()
+                        .filter(|x| x.name.local.as_ref() == "href")
+                        .take(1) // An `a` tag shouldn't have more than one `href`
+                        .filter_map(|x| origin.join(&x.value).ok())
+                        .for_each(|x| {
+                            xs.insert(x);
+                        });
                 }
-                _ => {}
             }
             true
         },
