@@ -185,6 +185,8 @@ impl Client {
         std::fs::create_dir_all(&cache_dir).unwrap();
         Self {
             client: reqwest::Client::builder()
+                // `timeout` doesn't work without `connect_timeout`.
+                .connect_timeout(core::time::Duration::from_secs(60))
                 .timeout(core::time::Duration::from_secs(60))
                 .build()
                 .unwrap(),
@@ -253,7 +255,7 @@ fn inner_text(dom: &RcDom) -> String {
                     text.push_str(contents.borrow().to_string().as_str());
                 }
                 NodeData::Element { ref name, .. } => {
-                    // The contents of script tags are invisible,
+                    // The contents of script tags are invisible
                     // and shouldn't be searched.
                     if name.local.as_ref() == "script" {
                         return false;
