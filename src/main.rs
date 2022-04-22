@@ -1,7 +1,7 @@
 use clap::{command, Arg};
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
-use regex::Regex;
+use regex::RegexBuilder;
 use reqwest::Url;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -79,6 +79,12 @@ async fn main() -> Result<(), reqwest::Error> {
                 .help("URIs to start search from"),
         )
         .arg(
+            Arg::new("ignore-case")
+                .short('i')
+                .long("ignore-case")
+                .help("Search case insensitively"),
+        )
+        .arg(
             Arg::new("depth")
                 .short('d')
                 .long("max-depth")
@@ -88,7 +94,10 @@ async fn main() -> Result<(), reqwest::Error> {
         )
         .get_matches();
 
-    let re = Regex::new(matches.value_of("pattern").unwrap()).unwrap();
+    let re = RegexBuilder::new(matches.value_of("pattern").unwrap())
+        .case_insensitive(matches.is_present("ignore-case"))
+        .build()
+        .unwrap();
     let max_depth = matches.value_of("depth").unwrap().parse().unwrap();
 
     let mut xs: Vec<Node<Url>> = matches
