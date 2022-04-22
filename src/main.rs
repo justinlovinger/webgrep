@@ -161,7 +161,7 @@ async fn main() -> Result<(), reqwest::Error> {
                         links(&rcx.value, &dom)
                             .into_iter()
                             .filter(|u| !xpath.contains(&u))
-                            .for_each(|u| xs.push(Node::new(Some(rcx.clone()), u)));
+                            .for_each(|u| xs.push(Node::new(Some(Rc::clone(&rcx)), u)));
                     }
                 }
             }
