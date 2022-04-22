@@ -1,6 +1,7 @@
 use clap::{command, Arg};
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
+use regex::Regex;
 use reqwest::Url;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -63,12 +64,12 @@ pub fn path_to_root<T>(x: &Rc<Node<T>>) -> NodePathIterator<T> {
 #[tokio::main]
 async fn main() -> Result<(), reqwest::Error> {
     let matches = command!()
-        .about("Recursively search the web, starting from URI..., for PHRASE")
+        .about("Recursively search the web, starting from URI..., for PATTERN")
         .arg(
-            Arg::new("phrase")
+            Arg::new("pattern")
                 .required(true)
-                .value_name("PHRASE")
-                .help("Phrase to search for"),
+                .value_name("PATTERN")
+                .help("Regex pattern to search for"),
         )
         .arg(
             Arg::new("uri")
@@ -87,7 +88,7 @@ async fn main() -> Result<(), reqwest::Error> {
         )
         .get_matches();
 
-    let phrase = matches.value_of("phrase").unwrap();
+    let re = Regex::new(matches.value_of("pattern").unwrap()).unwrap();
     let max_depth = matches.value_of("depth").unwrap().parse().unwrap();
 
     let mut xs: Vec<Node<Url>> = matches
@@ -126,7 +127,7 @@ async fn main() -> Result<(), reqwest::Error> {
                         .read_from(&mut body.as_bytes())
                         .ok()
                 }) {
-                    if inner_text(&dom).contains(phrase) {
+                    if re.is_match(&inner_text(&dom)) {
                         let _ = werr.write_all(CLEAR_CODE);
                         let _ = werr.flush();
                         // `map(...).intersperse(" > ")` would be better,
