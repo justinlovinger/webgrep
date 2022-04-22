@@ -94,6 +94,7 @@ async fn main() -> Result<(), reqwest::Error> {
         .values_of("uri")
         .unwrap()
         .map(|x| Node::new(None, x.parse().unwrap()))
+        .rev() // Otherwise, we unintuitively search from last to first.
         .collect();
     let mut werr = io::BufWriter::new(io::stderr());
     let client = Client::new();
