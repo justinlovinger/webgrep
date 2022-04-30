@@ -360,13 +360,12 @@ impl CachingClient {
     }
 
     async fn get_from_cache(&self, u: &Url) -> Option<SerializableResponse> {
-        task::block_in_place(|| {
-            bincode::deserialize_from(io::BufReader::new(
-                // TODO: wait and retry on IO error.
-                std::fs::File::open(self.cache_path(u)).ok()?,
-            ))
+        // `bincode::deserialize_from` may panic
+        // if file contents don't match expected format.
+        tokio::fs::read(self.cache_path(u))
+            .await
             .ok()
-        })
+            .and_then(|x| bincode::deserialize(&x).ok())
     }
 
     async fn get_and_cache_from_web(&self, u: &Url) -> SerializableResponse {
