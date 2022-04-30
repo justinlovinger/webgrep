@@ -161,7 +161,7 @@ async fn main() -> Result<(), reqwest::Error> {
     let mut host_resources = HashMap::new();
     let add_url =
         |node: Node<Url>,
-         host_resources: &mut HashMap<_, (BinaryHeap<_>, _, Vec<task::JoinHandle<_>>)>| {
+         host_resources: &mut HashMap<_, (BinaryHeap<_>, _, Option<task::JoinHandle<_>>)>| {
             // Making more than one request at a time
             // to a host
             // could result in repercussions,
@@ -201,9 +201,7 @@ async fn main() -> Result<(), reqwest::Error> {
                                 Arc::clone(&master_client),
                                 Arc::clone(&cache_dir),
                             ))),
-                            // TODO: replace with `Option`,
-                            // we're only queuing one at a time:
-                            Vec::new(),
+                            Option::None,
                         ),
                     );
                 }
@@ -248,9 +246,10 @@ async fn main() -> Result<(), reqwest::Error> {
         );
 
         if page_tasks.len() < page_buffer_size {
-            for (urls, client, tasks) in host_resources.values_mut() {
-                swap_retain_mut(
-                    |x| match x.now_or_never() {
+            for (urls, client, task) in host_resources.values_mut() {
+                if let Some(x) = task
+                    .take()
+                    .and_then(|mut task| match (&mut task).now_or_never() {
                         Some(Ok((mbody, node))) => {
                             if let Some(body) = mbody {
                                 let re_ = Arc::clone(&re);
@@ -258,21 +257,21 @@ async fn main() -> Result<(), reqwest::Error> {
                                     parse_page(max_depth, &re_, node, body)
                                 }));
                             };
-                            false
+                            None
                         }
                         Some(Err(e)) => panic!("{}", e),
-                        None => true,
-                    },
-                    tasks,
-                );
-
-                if tasks.is_empty() {
-                    if let Some(x) = urls.pop() {
-                        let client_ = Arc::clone(client);
-                        tasks.push(task::spawn(async move {
-                            (client_.lock().await.get(&x.value).await, x)
-                        }));
-                    }
+                        None => Some(task),
+                    })
+                    .or_else(|| {
+                        urls.pop().map(|x| {
+                            let client_ = Arc::clone(client);
+                            task::spawn(
+                                async move { (client_.lock().await.get(&x.value).await, x) },
+                            )
+                        })
+                    })
+                {
+                    _ = task.insert(x);
                 }
             }
         }
@@ -285,8 +284,8 @@ async fn main() -> Result<(), reqwest::Error> {
         let progress_line = {
             let (num_urls, num_request_tasks) = host_resources
                 .values()
-                .fold((0, 0), |(x, y), (urls, _, tasks)| {
-                    (x + urls.len(), y + tasks.len())
+                .fold((0, 0), |(x, y), (urls, _, task)| {
+                    (x + urls.len(), y + task.as_ref().map_or(0, |_| 1))
                 });
             format!(
                 "request tasks: {:>2}, page tasks: {:>2}, urls: {}",
@@ -310,7 +309,7 @@ async fn main() -> Result<(), reqwest::Error> {
         if page_tasks.is_empty()
             && host_resources
                 .values()
-                .all(|(urls, _, tasks)| urls.is_empty() && tasks.is_empty())
+                .all(|(urls, _, task)| urls.is_empty() && task.is_none())
         {
             return Ok(());
         }
