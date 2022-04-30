@@ -328,7 +328,7 @@ where
 {
     let mut i = 0;
     while i < xs.len() {
-        if (&mut f)(&mut xs[i]) {
+        if f(&mut xs[i]) {
             i += 1;
         } else {
             xs.swap_remove(i);
