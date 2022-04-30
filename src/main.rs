@@ -1,26 +1,33 @@
 use clap::{command, Arg};
+use futures::future::FutureExt;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use reqwest::Url;
+use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BinaryHeap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::default::Default;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
+use tokio::{task, time};
+use url::Host::{Domain, Ipv4, Ipv6};
 
 const CLEAR_CODE: &[u8] = b"\r\x1B[K";
 
 pub struct Node<T> {
-    parent: Option<Rc<Node<T>>>,
+    depth: u64,
+    parent: Option<Arc<Node<T>>>,
     value: T,
 }
 
 pub struct NodePathIterator<'a, T> {
-    node: Option<&'a Rc<Node<T>>>,
+    node: Option<&'a Arc<Node<T>>>,
 }
 
 impl<'a, T> Iterator for NodePathIterator<'a, T> {
@@ -34,15 +41,16 @@ impl<'a, T> Iterator for NodePathIterator<'a, T> {
 }
 
 impl<T> Node<T> {
-    pub fn new(parent: Option<Rc<Node<T>>>, value: T) -> Self {
-        Node { parent, value }
+    pub fn new(parent: Option<Arc<Node<T>>>, value: T) -> Self {
+        Node {
+            depth: parent.as_ref().map_or(0, |p| p.depth + 1),
+            parent,
+            value,
+        }
     }
 
     pub fn depth(&self) -> u64 {
-        match &self.parent {
-            Some(p) => p.depth() + 1,
-            None => 0,
-        }
+        self.depth
     }
 
     pub fn path_from_root(&self) -> Vec<&T> {
@@ -57,8 +65,28 @@ impl<T> Node<T> {
     }
 }
 
-pub fn path_to_root<T>(x: &Rc<Node<T>>) -> NodePathIterator<T> {
+pub fn path_to_root<T>(x: &Arc<Node<T>>) -> NodePathIterator<T> {
     NodePathIterator { node: Some(x) }
+}
+
+impl<T> Ord for Node<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.depth().cmp(&other.depth())
+    }
+}
+
+impl<T> PartialOrd for Node<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Eq for Node<T> {}
+
+impl<T> PartialEq for Node<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.depth() == other.depth()
+    }
 }
 
 #[tokio::main]
@@ -94,143 +122,265 @@ async fn main() -> Result<(), reqwest::Error> {
         )
         .get_matches();
 
-    let re = RegexBuilder::new(matches.value_of("pattern").unwrap())
-        .case_insensitive(matches.is_present("ignore-case"))
-        .build()
-        .unwrap();
+    let re = Arc::new(
+        RegexBuilder::new(matches.value_of("pattern").unwrap())
+            .case_insensitive(matches.is_present("ignore-case"))
+            .build()
+            .unwrap(),
+    );
     let max_depth = matches.value_of("depth").unwrap().parse().unwrap();
 
-    let mut xs: Vec<Node<Url>> = matches
-        .values_of("uri")
-        .unwrap()
-        .map(|x| Node::new(None, x.parse().unwrap()))
-        .rev() // Otherwise, we unintuitively search from last to first.
-        .collect();
-    let mut werr = io::BufWriter::new(io::stderr());
-    let client = Client::new();
-    loop {
-        match xs.pop() {
-            Some(x) => {
-                // Search may spend a long time between matches,
-                // but we don't want to clutter output
-                // with every URL.
-                // Overflowing terminal width
-                // may prevent clearing the line.
-                let _ = werr.write_all(CLEAR_CODE);
-                let _ = match terminal_size::terminal_size() {
-                    Some((terminal_size::Width(w), _)) => {
-                        let s = x.value.as_str().as_bytes();
-                        // Slice is safe
-                        // because the string will never be longer than itself.
-                        werr.write_all(unsafe {
-                            s.get_unchecked(..std::cmp::min(s.len(), w.into()))
-                        })
-                    }
-                    None => werr.write_all(x.value.as_str().as_bytes()),
-                };
-                let _ = werr.flush();
+    let master_client = Arc::new(
+        reqwest::Client::builder()
+            // let master_client = reqwest::Client::builder()
+            // `timeout` doesn't work without `connect_timeout`.
+            .connect_timeout(core::time::Duration::from_secs(60))
+            .timeout(core::time::Duration::from_secs(60))
+            .build()
+            .unwrap(),
+    );
 
-                if let Some(dom) = client.get(&x.value).await.and_then(|body| {
-                    html5ever::parse_document(RcDom::default(), Default::default())
-                        .from_utf8()
-                        .read_from(&mut body.as_bytes())
-                        .ok()
-                }) {
-                    if re.is_match(&inner_text(&dom)) {
-                        let _ = werr.write_all(CLEAR_CODE);
-                        let _ = werr.flush();
-                        // `map(...).intersperse(" > ")` would be better,
-                        // but it is only available in nightly builds
-                        // as of 2022-04-18.
-                        println!(
-                            "{}",
-                            x.path_from_root()
-                                .iter()
-                                .map(|u| u.as_str())
-                                .collect::<Vec<_>>()
-                                .join(" > ")
-                        );
-                    }
-
-                    if x.depth() < max_depth {
-                        let rcx = Rc::new(x);
-                        // We don't need to know if a path cycles back on itself.
-                        // For us,
-                        // path cycles waste time and lead to infinite loops.
-                        let xpath: HashSet<_> = path_to_root(&rcx).collect();
-                        links(&rcx.value, &dom)
-                            .into_iter()
-                            .filter(|u| !xpath.contains(&u))
-                            .for_each(|u| xs.push(Node::new(Some(Rc::clone(&rcx)), u)));
-                    }
-                }
-            }
-            None => return Ok(()),
-        }
-    }
-}
-
-struct Client {
-    client: reqwest::Client,
-    cache_dir: PathBuf,
-}
-
-type SerializableResponse = Result<String, String>;
-
-impl Client {
-    pub fn new() -> Self {
-        let cache_dir = std::env::var("XDG_CACHE_HOME")
+    let cache_dir = Arc::new(
+        std::env::var("XDG_CACHE_HOME")
+            // let cache_dir = std::env::var("XDG_CACHE_HOME")
             .map_or(
                 Path::new(std::env::var("HOME").unwrap().as_str()).join(".cache"),
                 PathBuf::from,
             )
-            .join("web-grep");
-        std::fs::create_dir_all(&cache_dir).unwrap();
+            .join("web-grep"),
+    );
+    std::fs::create_dir_all(cache_dir.as_ref()).unwrap();
+
+    // Tokio uses number of CPU cores as default number of worker threads.
+    // `tokio::runtime::Handle::current().metrics().num_workers()`
+    // is only available in unstable Tokio.
+    let page_buffer_size = 10 * num_cpus::get();
+
+    let mut page_tasks = Vec::with_capacity(page_buffer_size);
+
+    let mut host_resources = HashMap::new();
+    let add_url =
+        |node: Node<Url>,
+         host_resources: &mut HashMap<_, (BinaryHeap<_>, _, Vec<task::JoinHandle<_>>)>| {
+            // Making more than one request at a time
+            // to a host
+            // could result in repercussions,
+            // like IP banning.
+            // Most websites host all subdomains together,
+            // so we to limit requests by domain,
+            // not FQDN.
+            let host = match node.value.host() {
+                Some(Domain(x)) => {
+                    match x.rmatch_indices('.').nth(1) {
+                        // Slice is safe,
+                        // because `.` is one byte
+                        // `rmatch_indices` always returns valid indices,
+                        // and there will always be at least one character
+                        // after the second match from the right.
+                        Some((i, _)) => unsafe { x.get_unchecked(i + 1..) },
+                        None => x,
+                    }
+                }
+                Some(Ipv4(_)) => node.value.host_str().unwrap(),
+                Some(Ipv6(_)) => node.value.host_str().unwrap(),
+                None => "",
+            };
+            match host_resources.get_mut(host) {
+                Some((urls, _, _)) => urls.push(node),
+                None => {
+                    let host_string = host.to_owned();
+                    let mut urls = BinaryHeap::with_capacity(1);
+                    urls.push(node);
+                    host_resources.insert(
+                        host_string,
+                        (
+                            urls,
+                            // Mutex locking each host client
+                            // avoids simultaneous requests to a host.
+                            Arc::new(tokio::sync::Mutex::new(CachingClient::new(
+                                Arc::clone(&master_client),
+                                Arc::clone(&cache_dir),
+                            ))),
+                            // TODO: replace with `Option`,
+                            // we're only queuing one at a time:
+                            Vec::new(),
+                        ),
+                    );
+                }
+            };
+        };
+    matches
+        .values_of("uri")
+        .unwrap()
+        .map(|x| Node::new(None, x.parse().unwrap()))
+        .for_each(|x| add_url(x, &mut host_resources));
+
+    let mut werr = io::BufWriter::new(io::stderr());
+    loop {
+        // Despite the name,
+        // `now_or_never` doesn't make the `Future` return "never"
+        // if it doesn't return "now".
+
+        // We want to finish tasks
+        // before queuing new requests
+        // to maximize throughput
+        // and search deeper nodes.
+
+        swap_retain_mut(
+            |x: &mut task::JoinHandle<_>| match x.now_or_never() {
+                Some(Ok((mtext, mnodes))) => {
+                    if let Some(text) = mtext {
+                        let _ = werr.write_all(CLEAR_CODE);
+                        let _ = werr.flush();
+                        println!("{}", text);
+                    };
+                    if let Some(nodes) = mnodes {
+                        for node in nodes {
+                            add_url(node, &mut host_resources);
+                        }
+                    };
+                    false
+                }
+                Some(Err(e)) => panic!("{}", e),
+                None => true,
+            },
+            &mut page_tasks,
+        );
+
+        if page_tasks.len() < page_buffer_size {
+            for (urls, client, tasks) in host_resources.values_mut() {
+                swap_retain_mut(
+                    |x| match x.now_or_never() {
+                        Some(Ok((mbody, node))) => {
+                            if let Some(body) = mbody {
+                                let re_ = Arc::clone(&re);
+                                page_tasks.push(task::spawn(async move {
+                                    parse_page(max_depth, &re_, node, body)
+                                }));
+                            };
+                            false
+                        }
+                        Some(Err(e)) => panic!("{}", e),
+                        None => true,
+                    },
+                    tasks,
+                );
+
+                if tasks.is_empty() {
+                    if let Some(x) = urls.pop() {
+                        let client_ = Arc::clone(client);
+                        tasks.push(task::spawn(async move {
+                            (client_.lock().await.get(&x.value).await, x)
+                        }));
+                    }
+                }
+            }
+        }
+
+        // Search may spend a long time between matches.
+        // We want to indicate progress,
+        // but we don't want to clutter output.
+        // Overflowing terminal width
+        // may prevent clearing the line.
+        let progress_line = {
+            let (num_urls, num_request_tasks) = host_resources
+                .values()
+                .fold((0, 0), |(x, y), (urls, _, tasks)| {
+                    (x + urls.len(), y + tasks.len())
+                });
+            format!(
+                "request tasks: {:>2}, page tasks: {:>2}, urls: {}",
+                num_request_tasks,
+                page_tasks.len(),
+                num_urls
+            )
+        };
+        let _ = werr.write_all(CLEAR_CODE);
+        let _ = match terminal_size::terminal_size() {
+            Some((terminal_size::Width(w), _)) => {
+                let s = progress_line.as_bytes();
+                // Slice is safe
+                // because the string will never be longer than itself.
+                werr.write_all(unsafe { s.get_unchecked(..std::cmp::min(s.len(), w.into())) })
+            }
+            None => werr.write_all(progress_line.as_bytes()),
+        };
+        let _ = werr.flush();
+
+        if page_tasks.is_empty()
+            && host_resources
+                .values()
+                .all(|(urls, _, tasks)| urls.is_empty() && tasks.is_empty())
+        {
+            return Ok(());
+        }
+
+        // If we never yield,
+        // tasks may never get time to complete,
+        // and the program may stall.
+        task::yield_now().await;
+    }
+}
+
+// Like experimental `drain_filter`:
+fn swap_retain_mut<F, T>(mut f: F, xs: &mut Vec<T>)
+where
+    F: FnMut(&mut T) -> bool,
+{
+    let mut i = 0;
+    while i < xs.len() {
+        if (&mut f)(&mut xs[i]) {
+            i += 1;
+        } else {
+            xs.swap_remove(i);
+        };
+    }
+}
+
+struct CachingClient {
+    client: SlowClient,
+    cache_dir: Arc<PathBuf>,
+}
+
+type SerializableResponse = Result<String, String>;
+
+impl CachingClient {
+    pub fn new(client: Arc<reqwest::Client>, cache_dir: Arc<PathBuf>) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                // `timeout` doesn't work without `connect_timeout`.
-                .connect_timeout(core::time::Duration::from_secs(60))
-                .timeout(core::time::Duration::from_secs(60))
-                .build()
-                .unwrap(),
+            client: SlowClient::new(client),
             cache_dir,
         }
     }
 
     pub async fn get(&self, u: &Url) -> Option<String> {
-        match self.get_from_cache(u) {
+        match self.get_from_cache(u).await {
             Some(x) => x,
             None => self.get_and_cache_from_web(u).await,
         }
         .ok()
     }
 
-    fn get_from_cache(&self, u: &Url) -> Option<SerializableResponse> {
-        bincode::deserialize_from(io::BufReader::new(
-            std::fs::File::open(self.cache_path(u)).ok()?,
-        ))
-        .ok()
+    async fn get_from_cache(&self, u: &Url) -> Option<SerializableResponse> {
+        task::block_in_place(|| {
+            bincode::deserialize_from(io::BufReader::new(
+                // TODO: wait and retry on IO error.
+                std::fs::File::open(self.cache_path(u)).ok()?,
+            ))
+            .ok()
+        })
     }
 
     async fn get_and_cache_from_web(&self, u: &Url) -> SerializableResponse {
-        // Making web requests
-        // at the speed of a computer
-        // can have negative repercussions,
-        // like IP banning.
-        // TODO: sleep based on time since last request to this domain.
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        let body = self.client.get(u).await;
 
-        // The type we serialize must match what is expected by `get_from_cache`.
-        let body: SerializableResponse = match self.client.get(u.as_ref()).send().await {
-            Ok(x) => x.text().await.map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-
-        bincode::serialize_into(
-            io::BufWriter::new(std::fs::File::create(self.cache_path(u)).unwrap()),
-            &body,
-        )
-        .unwrap();
+        task::block_in_place(|| {
+            // TODO: wait and retry on IO error.
+            bincode::serialize_into(
+                io::BufWriter::new(std::fs::File::create(self.cache_path(u)).unwrap()),
+                &body,
+            )
+            .unwrap();
+        });
 
         body
     }
@@ -246,6 +396,86 @@ impl Client {
         let mut s = DefaultHasher::new();
         u.hash(&mut s);
         s.finish()
+    }
+}
+
+struct SlowClient {
+    client: Arc<reqwest::Client>,
+}
+
+impl SlowClient {
+    pub fn new(client: Arc<reqwest::Client>) -> Self {
+        Self { client }
+    }
+
+    pub async fn get(&self, u: &Url) -> SerializableResponse {
+        // Making web requests
+        // at the speed of a computer
+        // can have negative repercussions,
+        // like IP banning.
+        // TODO: sleep based on time since last request to this host:
+        // let time_left = 1 - (time - last_time)
+        // if time_left > 0 {
+        //     time::sleep(time::Duration::from_secs(time_left)).await;
+        // }
+        time::sleep(time::Duration::from_secs(1)).await;
+        // The type we serialize must match what is expected by `get_from_cache`.
+        let body: SerializableResponse = match self.client.get(u.as_ref()).send().await {
+            Ok(x) => x.text().await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        // TODO: update last request time.
+        body
+    }
+}
+
+fn parse_page(
+    max_depth: u64,
+    re: &Regex,
+    node: Node<Url>,
+    body: String,
+) -> (Option<String>, Option<Vec<Node<Url>>>) {
+    match html5ever::parse_document(RcDom::default(), Default::default())
+        .from_utf8()
+        .read_from(&mut body.as_bytes())
+        .ok()
+    {
+        Some(dom) => {
+            let mtext = if re.is_match(&inner_text(&dom)) {
+                // `map(...).intersperse(" > ")` would be better,
+                // but it is only available in nightly builds
+                // as of 2022-04-18.
+                Some(
+                    node.path_from_root()
+                        .iter()
+                        .map(|u| u.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" > "),
+                )
+            } else {
+                None
+            };
+
+            let mnodes = if node.depth() < max_depth {
+                let rcx = Arc::new(node);
+                // We don't need to know if a path cycles back on itself.
+                // For us,
+                // path cycles waste time and lead to infinite loops.
+                let xpath: HashSet<_> = path_to_root(&rcx).collect();
+                Some(
+                    links(&rcx.value, &dom)
+                        .into_iter()
+                        .filter(|u| !xpath.contains(&u))
+                        .map(|u| Node::new(Some(Arc::clone(&rcx)), u))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            };
+
+            (mtext, mnodes)
+        }
+        None => (None, None),
     }
 }
 
