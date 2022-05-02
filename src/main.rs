@@ -377,12 +377,13 @@ impl CachingClient {
         let body = self.client.get(u).await;
 
         task::block_in_place(|| {
-            // TODO: wait and retry on IO error.
-            bincode::serialize_into(
-                io::BufWriter::new(std::fs::File::create(self.cache_path(u)).unwrap()),
-                &body,
-            )
-            .unwrap();
+            // We would rather keep searching
+            // than panic
+            // or delay
+            // from failed caching.
+            if let Ok(file) = std::fs::File::create(self.cache_path(u)) {
+                let _ = bincode::serialize_into(io::BufWriter::new(file), &body);
+            }
         });
 
         body
