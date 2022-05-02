@@ -131,7 +131,7 @@ async fn main() -> Result<(), reqwest::Error> {
                             // Mutex locking each host client
                             // avoids simultaneous requests to a host.
                             Arc::new(tokio::sync::Mutex::new(CachingClient::new(
-                                Arc::clone(&master_client),
+                                SlowClient::new(Arc::clone(&master_client)),
                                 Arc::clone(&cache_dir),
                             ))),
                             Option::None,
@@ -352,11 +352,8 @@ struct CachingClient {
 type SerializableResponse = Result<String, String>;
 
 impl CachingClient {
-    pub fn new(client: Arc<reqwest::Client>, cache_dir: Arc<PathBuf>) -> Self {
-        Self {
-            client: SlowClient::new(client),
-            cache_dir,
-        }
+    pub fn new(client: SlowClient, cache_dir: Arc<PathBuf>) -> Self {
+        Self { client, cache_dir }
     }
 
     pub async fn get(&self, u: &Url) -> Option<String> {
