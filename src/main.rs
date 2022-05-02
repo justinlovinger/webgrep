@@ -463,7 +463,7 @@ fn parse_page(
                 Some(
                     node.path_from_root()
                         .iter()
-                        .map(|u| u.as_str())
+                        .map(|x| x.as_str())
                         .collect::<Vec<_>>()
                         .join(" > "),
                 )
@@ -472,16 +472,16 @@ fn parse_page(
             };
 
             let mnodes = if node.depth() < max_depth {
-                let rcx = Arc::new(node);
+                let node_ = Arc::new(node);
                 // We don't need to know if a path cycles back on itself.
                 // For us,
                 // path cycles waste time and lead to infinite loops.
-                let xpath: HashSet<_> = path_to_root(&rcx).collect();
+                let node_path: HashSet<_> = path_to_root(&node_).collect();
                 Some(
-                    links(&rcx.value, &dom)
+                    links(&node_.value, &dom)
                         .into_iter()
-                        .filter(|u| !xpath.contains(&u))
-                        .map(|u| Node::new(Some(Arc::clone(&rcx)), u))
+                        .filter(|x| !node_path.contains(&x))
+                        .map(|x| Node::new(Some(Arc::clone(&node_)), x))
                         .collect::<Vec<_>>(),
                 )
             } else {
