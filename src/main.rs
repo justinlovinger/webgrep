@@ -179,7 +179,7 @@ async fn main() -> Result<(), reqwest::Error> {
         );
 
         if page_tasks.len() < page_buffer_size {
-            for (urls, client, task) in host_resources.values_mut() {
+            host_resources.retain(|_, (urls, client, task)| {
                 if let Some(x) = task
                     .take()
                     .and_then(|mut task| match (&mut task).now_or_never() {
@@ -204,9 +204,15 @@ async fn main() -> Result<(), reqwest::Error> {
                         })
                     })
                 {
+                    debug_assert!(task.is_none());
                     _ = task.insert(x);
+                    true
+                } else {
+                    debug_assert!(task.is_none() && urls.is_empty());
+                    // TODO: replace `false` with `client.client().time_remaining() > 0`.
+                    false
                 }
-            }
+            });
         }
 
         // Search may spend a long time between matches.
