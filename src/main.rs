@@ -1,4 +1,4 @@
-use clap::{command, Arg};
+use clap::Parser;
 use futures::future::FutureExt;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
@@ -22,62 +22,45 @@ const CLEAR_CODE: &[u8] = b"\r\x1B[K";
 
 const BODY_SIZE_LIMIT: u64 = 104857600; // bytes
 
+#[derive(Parser)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    /// Regex pattern to search for
+    #[clap(required = true, value_name = "PATTERN")]
+    pattern_re: Regex,
+
+    /// URIs to start search from
+    #[clap(multiple_occurrences = true, required = true, value_name = "URL")]
+    urls: Vec<Url>,
+
+    /// Limit search depth to NUM links from starting URL
+    #[clap(short = 'd', long, default_value_t = 1, value_name = "NUM")]
+    max_depth: u64,
+
+    /// Search case insensitively
+    #[clap(short = 'i', long)]
+    ignore_case: bool,
+
+    /// Exclude URLs matching regex pattern
+    #[clap(long, value_name = "PATTERN")]
+    exclude_urls_re: Option<Regex>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), reqwest::Error> {
-    let matches = command!()
-        .about("Recursively search the web, starting from URL..., for PATTERN")
-        .arg(
-            Arg::new("pattern")
-                .required(true)
-                .value_name("PATTERN")
-                .help("Regex pattern to search for"),
-        )
-        .arg(
-            Arg::new("url")
-                .multiple_occurrences(true)
-                .required(true)
-                .value_name("URL")
-                .help("URIs to start search from"),
-        )
-        .arg(
-            Arg::new("depth")
-                .short('d')
-                .long("max-depth")
-                .default_value("1")
-                .value_name("NUM")
-                .help("Limit search depth to NUM links from starting URL"),
-        )
-        .arg(
-            Arg::new("ignore-case")
-                .short('i')
-                .long("ignore-case")
-                .help("Search case insensitively"),
-        )
-        .arg(
-            Arg::new("exclude-urls")
-                .long("exclude-urls")
-                .value_name("PATTERN")
-                .help("Exclude URLs matching regex pattern"),
-        )
-        .get_matches();
+    let args = Args::parse();
 
     let re = Arc::new(
-        RegexBuilder::new(matches.value_of("pattern").unwrap())
-            .case_insensitive(matches.is_present("ignore-case"))
+        RegexBuilder::new(args.pattern_re.as_str())
+            .case_insensitive(args.ignore_case)
             .build()
             .unwrap(),
     );
-    let max_depth = matches.value_of("depth").unwrap().parse().unwrap();
 
-    let exclude_urls_re = Arc::new(
-        matches
-            .value_of("exclude-urls")
-            .map(|x| Regex::new(x).unwrap()),
-    );
+    let exclude_urls_re = Arc::new(args.exclude_urls_re);
 
     let master_client = Arc::new(
         reqwest::Client::builder()
-            // let master_client = reqwest::Client::builder()
             // `timeout` doesn't work without `connect_timeout`.
             .connect_timeout(core::time::Duration::from_secs(60))
             .timeout(core::time::Duration::from_secs(60))
@@ -87,7 +70,6 @@ async fn main() -> Result<(), reqwest::Error> {
 
     let cache_dir = Arc::new(
         std::env::var("XDG_CACHE_HOME")
-            // let cache_dir = std::env::var("XDG_CACHE_HOME")
             .map_or(
                 Path::new(std::env::var("HOME").unwrap().as_str()).join(".cache"),
                 PathBuf::from,
@@ -152,10 +134,9 @@ async fn main() -> Result<(), reqwest::Error> {
                 }
             };
         };
-    matches
-        .values_of("url")
-        .unwrap()
-        .map(|x| Node::new(None, x.parse().unwrap()))
+    args.urls
+        .into_iter()
+        .map(|x| Node::new(None, x))
         .for_each(|x| add_url(x, &mut host_resources));
 
     let mut werr = io::BufWriter::new(io::stderr());
@@ -200,7 +181,7 @@ async fn main() -> Result<(), reqwest::Error> {
                                 let re_ = Arc::clone(&re);
                                 let exclude_re_ = Arc::clone(&exclude_urls_re);
                                 page_tasks.push(task::spawn(async move {
-                                    parse_page(max_depth, &re_, &exclude_re_, node, body)
+                                    parse_page(args.max_depth, &re_, &exclude_re_, node, body)
                                 }));
                             };
                             None
