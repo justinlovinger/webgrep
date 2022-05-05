@@ -53,6 +53,12 @@ async fn main() -> Result<(), reqwest::Error> {
                 .long("ignore-case")
                 .help("Search case insensitively"),
         )
+        .arg(
+            Arg::new("exclude-urls")
+                .long("exclude-urls")
+                .value_name("PATTERN")
+                .help("Exclude URLs matching regex pattern"),
+        )
         .get_matches();
 
     let re = Arc::new(
@@ -62,6 +68,12 @@ async fn main() -> Result<(), reqwest::Error> {
             .unwrap(),
     );
     let max_depth = matches.value_of("depth").unwrap().parse().unwrap();
+
+    let exclude_urls_re = Arc::new(
+        matches
+            .value_of("exclude-urls")
+            .map(|x| Regex::new(x).unwrap()),
+    );
 
     let master_client = Arc::new(
         reqwest::Client::builder()
@@ -186,8 +198,9 @@ async fn main() -> Result<(), reqwest::Error> {
                         Some(Ok((mbody, node))) => {
                             if let Some(body) = mbody {
                                 let re_ = Arc::clone(&re);
+                                let exclude_re_ = Arc::clone(&exclude_urls_re);
                                 page_tasks.push(task::spawn(async move {
-                                    parse_page(max_depth, &re_, node, body)
+                                    parse_page(max_depth, &re_, &exclude_re_, node, body)
                                 }));
                             };
                             None
@@ -448,6 +461,7 @@ impl SlowClient {
 fn parse_page(
     max_depth: u64,
     re: &Regex,
+    exclude_urls_re: &Option<Regex>,
     node: Node<Url>,
     body: String,
 ) -> (Option<String>, Option<Vec<Node<Url>>>) {
@@ -474,14 +488,21 @@ fn parse_page(
 
             let mnodes = if node.depth() < max_depth {
                 let node_ = Arc::new(node);
-                // We don't need to know if a path cycles back on itself.
-                // For us,
-                // path cycles waste time and lead to infinite loops.
                 let node_path: HashSet<_> = path_to_root(&node_).collect();
                 Some(
                     links(&node_.value, &dom)
                         .into_iter()
+                        // We don't need to know if a path cycles back on itself.
+                        // For us,
+                        // path cycles waste time and lead to infinite loops.
                         .filter(|x| !node_path.contains(&x))
+                        // We're hoping the Rust compiler optimizes this branch
+                        // out of the loop.
+                        .filter(|x| {
+                            exclude_urls_re
+                                .as_ref()
+                                .map_or(true, |re| !re.is_match(x.as_str()))
+                        })
                         .map(|x| Node::new(Some(Arc::clone(&node_)), x))
                         .collect::<Vec<_>>(),
                 )
