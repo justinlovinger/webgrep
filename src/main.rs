@@ -25,7 +25,7 @@ const BODY_SIZE_LIMIT: u64 = 104857600; // bytes
 #[tokio::main]
 async fn main() -> Result<(), reqwest::Error> {
     let matches = command!()
-        .about("Recursively search the web, starting from URI..., for PATTERN")
+        .about("Recursively search the web, starting from URL..., for PATTERN")
         .arg(
             Arg::new("pattern")
                 .required(true)
@@ -33,17 +33,11 @@ async fn main() -> Result<(), reqwest::Error> {
                 .help("Regex pattern to search for"),
         )
         .arg(
-            Arg::new("uri")
+            Arg::new("url")
                 .multiple_occurrences(true)
                 .required(true)
-                .value_name("URI")
+                .value_name("URL")
                 .help("URIs to start search from"),
-        )
-        .arg(
-            Arg::new("ignore-case")
-                .short('i')
-                .long("ignore-case")
-                .help("Search case insensitively"),
         )
         .arg(
             Arg::new("depth")
@@ -51,7 +45,13 @@ async fn main() -> Result<(), reqwest::Error> {
                 .long("max-depth")
                 .default_value("1")
                 .value_name("NUM")
-                .help("Limit search depth to NUM links from starting URI"),
+                .help("Limit search depth to NUM links from starting URL"),
+        )
+        .arg(
+            Arg::new("ignore-case")
+                .short('i')
+                .long("ignore-case")
+                .help("Search case insensitively"),
         )
         .get_matches();
 
@@ -141,7 +141,7 @@ async fn main() -> Result<(), reqwest::Error> {
             };
         };
     matches
-        .values_of("uri")
+        .values_of("url")
         .unwrap()
         .map(|x| Node::new(None, x.parse().unwrap()))
         .for_each(|x| add_url(x, &mut host_resources));
