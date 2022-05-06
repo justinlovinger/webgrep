@@ -52,33 +52,33 @@ struct Args {
 async fn main() -> Result<(), reqwest::Error> {
     let args = Args::parse();
 
-    let re = Arc::new(
+    let re: &'static _ = Box::leak(Box::new(
         RegexBuilder::new(args.pattern_re.as_str())
             .case_insensitive(args.ignore_case)
             .build()
             .unwrap(),
-    );
+    ));
 
-    let exclude_urls_re = Arc::new(args.exclude_urls_re);
+    let exclude_urls_re: &'static _ = Box::leak(Box::new(args.exclude_urls_re));
 
-    let master_client = Arc::new(
+    let master_client: &'static _ = Box::leak(Box::new(
         reqwest::Client::builder()
             // `timeout` doesn't work without `connect_timeout`.
             .connect_timeout(core::time::Duration::from_secs(60))
             .timeout(core::time::Duration::from_secs(60))
             .build()
             .unwrap(),
-    );
+    ));
 
-    let cache_dir = Arc::new(
+    let cache_dir: &'static _ = Box::leak(Box::new(
         std::env::var("XDG_CACHE_HOME")
             .map_or(
                 Path::new(std::env::var("HOME").unwrap().as_str()).join(".cache"),
                 PathBuf::from,
             )
             .join("web-grep"),
-    );
-    std::fs::create_dir_all(cache_dir.as_ref()).unwrap();
+    ));
+    std::fs::create_dir_all(cache_dir).unwrap();
 
     // Tokio uses number of CPU cores as default number of worker threads.
     // `tokio::runtime::Handle::current().metrics().num_workers()`
@@ -127,8 +127,8 @@ async fn main() -> Result<(), reqwest::Error> {
                             // Mutex locking each host client
                             // avoids simultaneous requests to a host.
                             Arc::new(tokio::sync::Mutex::new(CachingClient::new(
-                                SlowClient::new(Arc::clone(&master_client)),
-                                Arc::clone(&cache_dir),
+                                SlowClient::new(master_client),
+                                cache_dir,
                             ))),
                             Option::None,
                         ),
@@ -180,10 +180,8 @@ async fn main() -> Result<(), reqwest::Error> {
                     .and_then(|mut task| match (&mut task).now_or_never() {
                         Some(Ok((mbody, node))) => {
                             if let Some(body) = mbody {
-                                let re_ = Arc::clone(&re);
-                                let exclude_re_ = Arc::clone(&exclude_urls_re);
                                 page_tasks.push(task::spawn(async move {
-                                    parse_page(args.max_depth, &re_, &exclude_re_, node, body)
+                                    parse_page(args.max_depth, re, exclude_urls_re, node, body)
                                 }));
                             };
                             None
@@ -271,15 +269,15 @@ where
     }
 }
 
-struct CachingClient {
-    client: SlowClient,
-    cache_dir: Arc<PathBuf>,
+struct CachingClient<'a> {
+    client: SlowClient<'a>,
+    cache_dir: &'a Path,
 }
 
 type SerializableResponse = Result<String, String>;
 
-impl CachingClient {
-    pub fn new(client: SlowClient, cache_dir: Arc<PathBuf>) -> Self {
+impl<'a> CachingClient<'a> {
+    pub fn new(client: SlowClient<'a>, cache_dir: &'a Path) -> Self {
         Self { client, cache_dir }
     }
 
@@ -330,12 +328,12 @@ impl CachingClient {
     }
 }
 
-struct SlowClient {
-    client: Arc<reqwest::Client>,
+struct SlowClient<'a> {
+    client: &'a reqwest::Client,
 }
 
-impl SlowClient {
-    pub fn new(client: Arc<reqwest::Client>) -> Self {
+impl<'a> SlowClient<'a> {
+    pub fn new(client: &'a reqwest::Client) -> Self {
         Self { client }
     }
 
