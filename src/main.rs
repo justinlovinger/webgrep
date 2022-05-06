@@ -1,10 +1,12 @@
+mod node;
+
+use crate::node::{path_to_root, Node};
 use clap::Parser;
 use futures::future::FutureExt;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use regex::{Regex, RegexBuilder};
 use reqwest::Url;
-use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
@@ -96,7 +98,7 @@ async fn main() -> Result<(), reqwest::Error> {
             // Most websites host all subdomains together,
             // so we to limit requests by domain,
             // not FQDN.
-            let host = match node.value.host() {
+            let host = match node.value().host() {
                 Some(Domain(x)) => {
                     match x.rmatch_indices('.').nth(1) {
                         // Slice is safe,
@@ -108,8 +110,8 @@ async fn main() -> Result<(), reqwest::Error> {
                         None => x,
                     }
                 }
-                Some(Ipv4(_)) => node.value.host_str().unwrap(),
-                Some(Ipv6(_)) => node.value.host_str().unwrap(),
+                Some(Ipv4(_)) => node.value().host_str().unwrap(),
+                Some(Ipv6(_)) => node.value().host_str().unwrap(),
                 None => "",
             };
             match host_resources.get_mut(host) {
@@ -193,7 +195,7 @@ async fn main() -> Result<(), reqwest::Error> {
                         urls.pop().map(|x| {
                             let client_ = Arc::clone(client);
                             task::spawn(
-                                async move { (client_.lock().await.get(&x.value).await, x) },
+                                async move { (client_.lock().await.get(x.value()).await, x) },
                             )
                         })
                     })
@@ -267,75 +269,6 @@ where
             xs.swap_remove(i);
         };
     }
-}
-
-pub struct Node<T> {
-    depth: u64,
-    parent: Option<Arc<Node<T>>>,
-    value: T,
-}
-
-impl<T> Node<T> {
-    pub fn new(parent: Option<Arc<Node<T>>>, value: T) -> Self {
-        Node {
-            depth: parent.as_ref().map_or(0, |p| p.depth + 1),
-            parent,
-            value,
-        }
-    }
-
-    pub fn depth(&self) -> u64 {
-        self.depth
-    }
-
-    pub fn path_from_root(&self) -> Vec<&T> {
-        match &self.parent {
-            Some(p) => {
-                let mut xs = p.path_from_root();
-                xs.push(&self.value);
-                xs
-            }
-            None => Vec::from([&self.value]),
-        }
-    }
-}
-
-impl<T> Ord for Node<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.depth().cmp(&other.depth())
-    }
-}
-
-impl<T> PartialOrd for Node<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<T> Eq for Node<T> {}
-
-impl<T> PartialEq for Node<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.depth() == other.depth()
-    }
-}
-
-pub struct NodePathIterator<'a, T> {
-    node: Option<&'a Arc<Node<T>>>,
-}
-
-impl<'a, T> Iterator for NodePathIterator<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let x = self.node?;
-        self.node = x.parent.as_ref();
-        Some(&x.value)
-    }
-}
-
-pub fn path_to_root<T>(x: &Arc<Node<T>>) -> NodePathIterator<T> {
-    NodePathIterator { node: Some(x) }
 }
 
 struct CachingClient {
@@ -471,7 +404,7 @@ fn parse_page(
                 let node_ = Arc::new(node);
                 let node_path: HashSet<_> = path_to_root(&node_).collect();
                 Some(
-                    links(&node_.value, &dom)
+                    links(node_.value(), &dom)
                         .into_iter()
                         // We don't need to know if a path cycles back on itself.
                         // For us,
