@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use tokio::task;
 
-type SerializableResponse = Result<String, String>;
+pub type SerializableResponse = Result<String, String>;
 
 pub struct Cache {
     dir: PathBuf,
