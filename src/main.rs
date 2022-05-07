@@ -1,5 +1,7 @@
+mod cache;
 mod node;
 
+use crate::cache::Cache;
 use crate::node::{path_to_root, Node};
 use clap::Parser;
 use futures::future::FutureExt;
@@ -7,15 +9,12 @@ use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use regex::{Regex, RegexBuilder};
 use reqwest::Url;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::default::Default;
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::{task, time};
 use url::Host::{Domain, Ipv4, Ipv6};
@@ -67,18 +66,12 @@ async fn main() -> Result<(), reqwest::Error> {
             .connect_timeout(core::time::Duration::from_secs(60))
             .timeout(core::time::Duration::from_secs(60))
             .build()
-            .unwrap(),
+            .expect("Failed to initialize web client"),
     ));
 
-    let cache_dir: &'static _ = Box::leak(Box::new(
-        std::env::var("XDG_CACHE_HOME")
-            .map_or(
-                Path::new(std::env::var("HOME").unwrap().as_str()).join(".cache"),
-                PathBuf::from,
-            )
-            .join("web-grep"),
+    let cache: &'static _ = Box::leak(Box::new(
+        Cache::new().await.expect("Failed to initialize cache"),
     ));
-    std::fs::create_dir_all(cache_dir).unwrap();
 
     // Tokio uses number of CPU cores as default number of worker threads.
     // `tokio::runtime::Handle::current().metrics().num_workers()`
@@ -128,7 +121,7 @@ async fn main() -> Result<(), reqwest::Error> {
                             // avoids simultaneous requests to a host.
                             Arc::new(tokio::sync::Mutex::new(CachingClient::new(
                                 SlowClient::new(master_client),
-                                cache_dir,
+                                cache,
                             ))),
                             Option::None,
                         ),
@@ -271,60 +264,34 @@ where
 
 struct CachingClient<'a> {
     client: SlowClient<'a>,
-    cache_dir: &'a Path,
+    cache: &'a Cache,
 }
 
 type SerializableResponse = Result<String, String>;
 
 impl<'a> CachingClient<'a> {
-    pub fn new(client: SlowClient<'a>, cache_dir: &'a Path) -> Self {
-        Self { client, cache_dir }
+    pub fn new(client: SlowClient<'a>, cache: &'a Cache) -> Self {
+        Self { client, cache }
     }
 
     pub async fn get(&self, u: &Url) -> Option<String> {
-        match self.get_from_cache(u).await {
+        match self.cache.get(u).await {
             Some(x) => x,
             None => self.get_and_cache_from_web(u).await,
         }
         .ok()
     }
 
-    async fn get_from_cache(&self, u: &Url) -> Option<SerializableResponse> {
-        // `bincode::deserialize_from` may panic
-        // if file contents don't match expected format.
-        tokio::fs::read(self.cache_path(u))
-            .await
-            .ok()
-            .and_then(|x| bincode::deserialize(&x).ok())
-    }
-
     async fn get_and_cache_from_web(&self, u: &Url) -> SerializableResponse {
         let body = self.client.get(u).await;
 
-        task::block_in_place(|| {
-            // We would rather keep searching
-            // than panic
-            // or delay
-            // from failed caching.
-            if let Ok(file) = std::fs::File::create(self.cache_path(u)) {
-                let _ = bincode::serialize_into(io::BufWriter::new(file), &body);
-            }
-        });
+        // We would rather keep searching
+        // than panic
+        // or delay
+        // from failed caching.
+        let _ = self.cache.set(u, &body);
 
         body
-    }
-
-    fn cache_path(&self, u: &Url) -> PathBuf {
-        let mut filename = u.host_str().unwrap_or("nohost").to_owned();
-        filename.push('-');
-        filename.push_str(self.url_hash(u).to_string().as_str());
-        self.cache_dir.join(filename)
-    }
-
-    fn url_hash(&self, u: &Url) -> u64 {
-        let mut s = DefaultHasher::new();
-        u.hash(&mut s);
-        s.finish()
     }
 }
 
