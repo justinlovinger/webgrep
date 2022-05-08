@@ -18,6 +18,7 @@ use std::default::Default;
 use std::io;
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::task;
 use url::Host::{Domain, Ipv4, Ipv6};
 
@@ -167,7 +168,9 @@ async fn main() -> Result<(), reqwest::Error> {
         );
 
         if page_tasks.len() < page_buffer_size {
-            host_resources.retain(|_, (urls, client, task)| {
+            // We can't use `host_resources.retain` with `async`.
+            let mut to_remove = Vec::new();
+            for (key, (urls, client, task)) in host_resources.iter_mut() {
                 if let Some(x) = task
                     .take()
                     .and_then(|mut task| match (&mut task).now_or_never() {
@@ -193,13 +196,16 @@ async fn main() -> Result<(), reqwest::Error> {
                 {
                     debug_assert!(task.is_none());
                     _ = task.insert(x);
-                    true
                 } else {
                     debug_assert!(task.is_none() && urls.is_empty());
-                    // TODO: replace `false` with `client.client().time_remaining() > 0`.
-                    false
+                    if client.lock().await.client().time_remaining() <= Duration::ZERO {
+                        to_remove.push(key.to_owned());
+                    }
                 }
-            });
+            }
+            for key in to_remove {
+                host_resources.remove(&key);
+            }
         }
 
         // Search may spend a long time between matches.
