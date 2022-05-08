@@ -168,9 +168,7 @@ async fn main() -> Result<(), reqwest::Error> {
         );
 
         if page_tasks.len() < page_buffer_size {
-            // We can't use `host_resources.retain` with `async`.
-            let mut to_remove = Vec::new();
-            for (key, (urls, client, task)) in host_resources.iter_mut() {
+            host_resources.retain(|_, (urls, client, task)| {
                 if let Some(x) = task
                     .take()
                     .and_then(|mut task| match (&mut task).now_or_never() {
@@ -196,16 +194,14 @@ async fn main() -> Result<(), reqwest::Error> {
                 {
                     debug_assert!(task.is_none());
                     _ = task.insert(x);
+                    true
                 } else {
                     debug_assert!(task.is_none() && urls.is_empty());
-                    if client.lock().await.client().time_remaining() <= Duration::ZERO {
-                        to_remove.push(key.to_owned());
-                    }
+                    client
+                        .try_lock()
+                        .map_or(true, |x| x.client().time_remaining() > Duration::ZERO)
                 }
-            }
-            for key in to_remove {
-                host_resources.remove(&key);
-            }
+            });
         }
 
         // Search may spend a long time between matches.
