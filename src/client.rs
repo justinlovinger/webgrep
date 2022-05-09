@@ -1,6 +1,5 @@
 use crate::cache::{Cache, SerializableResponse};
 use reqwest::Url;
-use std::cmp::max;
 use std::time::{Duration, Instant};
 
 const BODY_SIZE_LIMIT: u64 = 104857600; // bytes
@@ -84,11 +83,7 @@ impl<'a> SlowClient<'a> {
 
     pub fn time_remaining(&self) -> Duration {
         self.last_request_finished
-            .map_or(Duration::ZERO, |last_request_finished| {
-                max(
-                    Duration::ZERO,
-                    Duration::from_secs(1) - last_request_finished.elapsed(),
-                )
-            })
+            .and_then(|x| Duration::from_secs(1).checked_sub(x.elapsed()))
+            .unwrap_or(Duration::ZERO)
     }
 }
