@@ -239,6 +239,7 @@ async fn main() -> Result<(), reqwest::Error> {
                 .values()
                 .all(|(urls, _, task)| urls.is_empty() && task.is_none())
         {
+            cache.flush().await.expect("Failed to flush cache");
             return Ok(());
         }
 
