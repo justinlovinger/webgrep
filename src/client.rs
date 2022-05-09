@@ -33,7 +33,7 @@ impl<'a> CachingClient<'a> {
         // than panic
         // or delay
         // from failed caching.
-        let _ = self.cache.set(u, &body);
+        let _ = self.cache.set(u, &body).await;
 
         body
     }
