@@ -24,6 +24,11 @@ use url::Host::{Domain, Ipv4, Ipv6};
 
 const CLEAR_CODE: &[u8] = b"\r\x1B[K";
 
+struct Page {
+    url: Url,
+    body: String,
+}
+
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
@@ -77,63 +82,46 @@ async fn main() -> Result<(), reqwest::Error> {
     // Tokio uses number of CPU cores as default number of worker threads.
     // `tokio::runtime::Handle::current().metrics().num_workers()`
     // is only available in unstable Tokio.
-    let page_buffer_size = 10 * num_cpus::get();
+    let node_buffer_size = 2 * num_cpus::get();
 
-    let mut page_tasks = Vec::with_capacity(page_buffer_size);
-
-    let mut host_resources = HashMap::new();
-    let add_url =
-        |node: Node<Url>,
-         host_resources: &mut HashMap<_, (BinaryHeap<_>, _, Option<task::JoinHandle<_>>)>| {
-            // Making more than one request at a time
-            // to a host
-            // could result in repercussions,
-            // like IP banning.
-            // Most websites host all subdomains together,
-            // so we to limit requests by domain,
-            // not FQDN.
-            let host = match node.value().host() {
-                Some(Domain(x)) => {
-                    match x.rmatch_indices('.').nth(1) {
-                        // Slice is safe,
-                        // because `.` is one byte
-                        // `rmatch_indices` always returns valid indices,
-                        // and there will always be at least one character
-                        // after the second match from the right.
-                        Some((i, _)) => unsafe { x.get_unchecked(i + 1..) },
-                        None => x,
-                    }
-                }
-                Some(Ipv4(_)) => node.value().host_str().unwrap(),
-                Some(Ipv6(_)) => node.value().host_str().unwrap(),
-                None => "",
-            };
-            match host_resources.get_mut(host) {
-                Some((urls, _, _)) => urls.push(node),
-                None => {
-                    let host_string = host.to_owned();
-                    let mut urls = BinaryHeap::with_capacity(1);
-                    urls.push(node);
-                    host_resources.insert(
-                        host_string,
-                        (
-                            urls,
-                            // Mutex locking each host client
-                            // avoids simultaneous requests to a host.
-                            Arc::new(tokio::sync::Mutex::new(CachingClient::new(
-                                SlowClient::new(master_client),
-                                cache,
-                            ))),
-                            Option::None,
-                        ),
-                    );
-                }
-            };
-        };
-    args.urls
+    // Making more than one request at a time
+    // to a host
+    // could result in repercussions,
+    // like IP banning.
+    // Most websites host all subdomains together,
+    // so we to limit requests by domain,
+    // not FQDN.
+    // Mutex locking each host client
+    // avoids simultaneous requests to a host.
+    let mut host_clients = HashMap::new();
+    let request_task = |host_clients: &mut HashMap<_, _>, p: Option<Arc<Node<Page>>>, u: Url| {
+        let client_ = Arc::clone(
+            host_clients
+                .entry(small_host_name(&u).to_owned())
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Mutex::new(CachingClient::new(
+                        SlowClient::new(master_client),
+                        cache,
+                    )))
+                }),
+        );
+        task::spawn(async move {
+            client_
+                .lock()
+                .await
+                .get(&u)
+                .await
+                .map(|body| Node::new(p, Page { url: u, body }))
+        })
+    };
+    let mut request_tasks: Vec<_> = args
+        .urls
         .into_iter()
-        .map(|x| Node::new(None, x))
-        .for_each(|x| add_url(x, &mut host_resources));
+        .map(|x| request_task(&mut host_clients, None, x))
+        .collect();
+
+    let mut nodes: BinaryHeap<_> = BinaryHeap::new();
+    let mut node_tasks = Vec::with_capacity(node_buffer_size);
 
     let mut werr = io::BufWriter::new(io::stderr());
     loop {
@@ -148,15 +136,32 @@ async fn main() -> Result<(), reqwest::Error> {
 
         swap_retain_mut(
             |x: &mut task::JoinHandle<_>| match x.now_or_never() {
-                Some(Ok((mtext, mnodes))) => {
+                Some(Ok(Some(node))) => {
+                    nodes.push(node);
+                    false
+                }
+                Some(Ok(None)) => false,
+                Some(Err(e)) => panic!("{}", e),
+                None => true,
+            },
+            &mut request_tasks,
+        );
+
+        swap_retain_mut(
+            |x: &mut task::JoinHandle<_>| match x.now_or_never() {
+                Some(Ok((mtext, murls))) => {
                     if let Some(text) = mtext {
                         let _ = werr.write_all(CLEAR_CODE);
                         let _ = werr.flush();
                         println!("{}", text);
                     };
-                    if let Some(nodes) = mnodes {
-                        for node in nodes {
-                            add_url(node, &mut host_resources);
+                    if let Some((node, urls)) = murls {
+                        for u in urls {
+                            request_tasks.push(request_task(
+                                &mut host_clients,
+                                Some(Arc::clone(&node)),
+                                u,
+                            ));
                         }
                     };
                     false
@@ -164,64 +169,40 @@ async fn main() -> Result<(), reqwest::Error> {
                 Some(Err(e)) => panic!("{}", e),
                 None => true,
             },
-            &mut page_tasks,
+            &mut node_tasks,
         );
 
-        if page_tasks.len() < page_buffer_size {
-            host_resources.retain(|_, (urls, client, task)| {
-                if let Some(x) = task
-                    .take()
-                    .and_then(|mut task| match (&mut task).now_or_never() {
-                        Some(Ok((mbody, node))) => {
-                            if let Some(body) = mbody {
-                                page_tasks.push(task::spawn(async move {
-                                    parse_page(args.max_depth, re, exclude_urls_re, node, body)
-                                }));
-                            };
-                            None
-                        }
-                        Some(Err(e)) => panic!("{}", e),
-                        None => Some(task),
-                    })
-                    .or_else(|| {
-                        urls.pop().map(|x| {
-                            let client_ = Arc::clone(client);
-                            task::spawn(
-                                async move { (client_.lock().await.get(x.value()).await, x) },
-                            )
-                        })
-                    })
-                {
-                    debug_assert!(task.is_none());
-                    _ = task.insert(x);
-                    true
-                } else {
-                    debug_assert!(task.is_none() && urls.is_empty());
-                    client
-                        .try_lock()
-                        .map_or(true, |x| x.client().time_remaining() > Duration::ZERO)
+        while node_tasks.len() < node_buffer_size {
+            match nodes.pop() {
+                Some(node) => {
+                    node_tasks.push(task::spawn(async move {
+                        parse_page(args.max_depth, re, exclude_urls_re, node)
+                    }));
                 }
-            });
+                None => break,
+            }
         }
+
+        // Host clients can accumulate over time,
+        // but we only need actively used clients.
+        host_clients.retain(|_, client| {
+            Arc::strong_count(client) > 1
+                || client
+                    .try_lock()
+                    .map_or(true, |x| x.client().time_remaining() > Duration::ZERO)
+        });
 
         // Search may spend a long time between matches.
         // We want to indicate progress,
         // but we don't want to clutter output.
         // Overflowing terminal width
         // may prevent clearing the line.
-        let progress_line = {
-            let (num_urls, num_request_tasks) = host_resources
-                .values()
-                .fold((0, 0), |(x, y), (urls, _, task)| {
-                    (x + urls.len(), y + task.as_ref().map_or(0, |_| 1))
-                });
-            format!(
-                "request tasks: {:>2}, page tasks: {:>2}, urls: {}",
-                num_request_tasks,
-                page_tasks.len(),
-                num_urls
-            )
-        };
+        let progress_line = format!(
+            "request tasks: {:>2}, node tasks: {:>2}, nodes: {}",
+            request_tasks.len(),
+            node_tasks.len(),
+            nodes.len()
+        );
         let _ = werr.write_all(CLEAR_CODE);
         let _ = match terminal_size::terminal_size() {
             Some((terminal_size::Width(w), _)) => {
@@ -234,11 +215,7 @@ async fn main() -> Result<(), reqwest::Error> {
         };
         let _ = werr.flush();
 
-        if page_tasks.is_empty()
-            && host_resources
-                .values()
-                .all(|(urls, _, task)| urls.is_empty() && task.is_none())
-        {
+        if nodes.is_empty() && node_tasks.is_empty() && request_tasks.is_empty() {
             cache.flush().await.expect("Failed to flush cache");
             return Ok(());
         }
@@ -247,6 +224,25 @@ async fn main() -> Result<(), reqwest::Error> {
         // tasks may never get time to complete,
         // and the program may stall.
         task::yield_now().await;
+    }
+}
+
+fn small_host_name(u: &Url) -> &str {
+    match u.host() {
+        Some(Domain(x)) => {
+            match x.rmatch_indices('.').nth(1) {
+                // Slice is safe,
+                // because `.` is one byte
+                // `rmatch_indices` always returns valid indices,
+                // and there will always be at least one character
+                // after the second match from the right.
+                Some((i, _)) => unsafe { x.get_unchecked(i + 1..) },
+                None => x,
+            }
+        }
+        Some(Ipv4(_)) => u.host_str().unwrap(),
+        Some(Ipv6(_)) => u.host_str().unwrap(),
+        None => "",
     }
 }
 
@@ -265,16 +261,16 @@ where
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_page(
     max_depth: u64,
     re: &Regex,
     exclude_urls_re: &Option<Regex>,
-    node: Node<Url>,
-    body: String,
-) -> (Option<String>, Option<Vec<Node<Url>>>) {
+    node: Node<Page>,
+) -> (Option<String>, Option<(Arc<Node<Page>>, Vec<Url>)>) {
     match html5ever::parse_document(RcDom::default(), Default::default())
         .from_utf8()
-        .read_from(&mut body.as_bytes())
+        .read_from(&mut node.value().body.as_bytes())
         .ok()
     {
         Some(dom) => {
@@ -285,7 +281,7 @@ fn parse_page(
                 Some(
                     node.path_from_root()
                         .iter()
-                        .map(|x| x.as_str())
+                        .map(|x| x.url.as_str())
                         .collect::<Vec<_>>()
                         .join(" > "),
                 )
@@ -295,24 +291,22 @@ fn parse_page(
 
             let mnodes = if node.depth() < max_depth {
                 let node_ = Arc::new(node);
-                let node_path: HashSet<_> = path_to_root(&node_).collect();
-                Some(
-                    links(node_.value(), &dom)
-                        .into_iter()
-                        // We don't need to know if a path cycles back on itself.
-                        // For us,
-                        // path cycles waste time and lead to infinite loops.
-                        .filter(|x| !node_path.contains(&x))
-                        // We're hoping the Rust compiler optimizes this branch
-                        // out of the loop.
-                        .filter(|x| {
-                            exclude_urls_re
-                                .as_ref()
-                                .map_or(true, |re| !re.is_match(x.as_str()))
-                        })
-                        .map(|x| Node::new(Some(Arc::clone(&node_)), x))
-                        .collect::<Vec<_>>(),
-                )
+                let node_path: HashSet<_> = path_to_root(&node_).map(|x| &x.url).collect();
+                let urls = links(&node_.value().url, &dom)
+                    .into_iter()
+                    // We don't need to know if a path cycles back on itself.
+                    // For us,
+                    // path cycles waste time and lead to infinite loops.
+                    .filter(|x| !node_path.contains(&x))
+                    // We're hoping the Rust compiler optimizes this branch
+                    // out of the loop.
+                    .filter(|x| {
+                        exclude_urls_re
+                            .as_ref()
+                            .map_or(true, |re| !re.is_match(x.as_str()))
+                    })
+                    .collect::<Vec<_>>();
+                Some((node_, urls))
             } else {
                 None
             };
