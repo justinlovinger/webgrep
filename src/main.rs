@@ -129,7 +129,13 @@ async fn main() -> Result<(), reqwest::Error> {
     let mut nodes = BinaryHeap::new();
     let mut node_tasks = Vec::with_capacity(node_buffer_size);
 
+    // TODO: use async IO.
     let mut werr = io::BufWriter::new(io::stderr());
+    let mut progress_i = std::u8::MAX;
+    let mut progress_shown = false;
+
+    let mut done_i = std::u16::MAX;
+
     loop {
         // Despite the name,
         // `now_or_never` doesn't make the `Future` return "never"
@@ -144,8 +150,12 @@ async fn main() -> Result<(), reqwest::Error> {
             |x: &mut task::JoinHandle<_>| match x.now_or_never() {
                 Some(Ok((match_data, children_data))) => {
                     if let Some(text) = match_data {
-                        let _ = werr.write_all(CLEAR_CODE);
-                        let _ = werr.flush();
+                        if progress_shown {
+                            let _ = werr.write_all(CLEAR_CODE);
+                            let _ = werr.flush();
+                            progress_shown = false;
+                        }
+                        // TODO: use async IO.
                         println!("{}", text);
                     };
                     if let Some((children, (node, urls))) = children_data {
@@ -212,46 +222,62 @@ async fn main() -> Result<(), reqwest::Error> {
             }
         }
 
-        // Search may spend a long time between matches.
-        // We want to indicate progress,
-        // but we don't want to clutter output.
-        // Overflowing terminal width
-        // may prevent clearing the line.
-        let progress_line = {
-            let (num_urls, num_request_tasks) = host_resources
-                .values()
-                .fold((0, 0), |(x, y), (urls, _, task)| {
-                    (x + urls.len(), y + task.as_ref().map_or(0, |_| 1))
-                });
-            format!(
-                "active requests: {:<2}, queued requests: {:<4}, pages searching: {:<2}, pages queued: {}",
-                num_request_tasks,
-                num_urls,
-                node_tasks.len(),
-                nodes.len()
-            )
-        };
-        let _ = werr.write_all(CLEAR_CODE);
-        let _ = match terminal_size::terminal_size() {
-            Some((terminal_size::Width(w), _)) => {
-                let s = progress_line.as_bytes();
-                // Slice is safe
-                // because the string will never be longer than itself.
-                werr.write_all(unsafe { s.get_unchecked(..std::cmp::min(s.len(), w.into())) })
-            }
-            None => werr.write_all(progress_line.as_bytes()),
-        };
-        let _ = werr.flush();
+        // We don't need to print progress
+        // as often as we need to coordinate tasks.
+        if !progress_shown || progress_i > 100 {
+            progress_i = 0;
 
-        if nodes.is_empty()
-            && node_tasks.is_empty()
-            && host_resources
-                .values()
-                .all(|(urls, _, task)| urls.is_empty() && task.is_none())
-        {
-            cache.flush().await.expect("Failed to flush cache");
-            return Ok(());
+            // Search may spend a long time between matches.
+            // We want to indicate progress,
+            // but we don't want to clutter output.
+            // Overflowing terminal width
+            // may prevent clearing the line.
+            let progress_line = {
+                let (num_urls, num_request_tasks) = host_resources
+                    .values()
+                    .fold((0, 0), |(x, y), (urls, _, task)| {
+                        (x + urls.len(), y + task.as_ref().map_or(0, |_| 1))
+                    });
+                format!(
+                    "active requests: {:<2}, queued requests: {:<4}, pages searching: {:<2}, pages queued: {}",
+                    num_request_tasks,
+                    num_urls,
+                    node_tasks.len(),
+                    nodes.len()
+                )
+            };
+            let _ = werr.write_all(CLEAR_CODE);
+            let _ = match terminal_size::terminal_size() {
+                Some((terminal_size::Width(w), _)) => {
+                    let s = progress_line.as_bytes();
+                    // Slice is safe
+                    // because the string will never be longer than itself.
+                    werr.write_all(unsafe { s.get_unchecked(..std::cmp::min(s.len(), w.into())) })
+                }
+                None => werr.write_all(progress_line.as_bytes()),
+            };
+            let _ = werr.flush();
+            progress_shown = true;
         }
+        progress_i += 1;
+
+        // Completion only matters once.
+        // We don't need to check often,
+        // and loops will occur faster
+        // without any tasks.
+        if done_i >= 1000 {
+            done_i = 0;
+            if nodes.is_empty()
+                && node_tasks.is_empty()
+                && host_resources
+                    .values()
+                    .all(|(urls, _, task)| urls.is_empty() && task.is_none())
+            {
+                cache.flush().await.expect("Failed to flush cache");
+                return Ok(());
+            }
+        }
+        done_i += 1;
 
         // If we never yield,
         // tasks may never get time to complete,
