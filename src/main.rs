@@ -94,7 +94,7 @@ async fn main() -> Result<(), reqwest::Error> {
     // Mutex locking each host client
     // avoids simultaneous requests to a host.
     let mut host_clients = HashMap::new();
-    let request_task = |host_clients: &mut HashMap<_, _>, p: Option<Arc<Node<Page>>>, u: Url| {
+    let request_task = |host_clients: &mut HashMap<_, _>, p, u| {
         // TODO: only make client
         // if `get_with_cache` needs it.
         let client_ = Arc::clone(
@@ -110,13 +110,13 @@ async fn main() -> Result<(), reqwest::Error> {
                 .map(|body| Node::new(p, Page { url: u, body }))
         })
     };
-    let mut request_tasks: Vec<_> = args
+    let mut request_tasks = args
         .urls
         .into_iter()
         .map(|x| request_task(&mut host_clients, None, x))
         .collect();
 
-    let mut nodes: BinaryHeap<_> = BinaryHeap::new();
+    let mut nodes = BinaryHeap::new();
     let mut node_tasks = Vec::with_capacity(node_buffer_size);
 
     let mut werr = io::BufWriter::new(io::stderr());
@@ -131,7 +131,7 @@ async fn main() -> Result<(), reqwest::Error> {
         // and search deeper nodes.
 
         swap_retain_mut(
-            |x: &mut task::JoinHandle<_>| match x.now_or_never() {
+            |x| match x.now_or_never() {
                 Some(Ok(Some(node))) => {
                     nodes.push(node);
                     false
