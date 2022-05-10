@@ -1,43 +1,8 @@
-use crate::cache::{Cache, SerializableResponse};
+use crate::cache::SerializableResponse;
 use reqwest::Url;
 use std::time::{Duration, Instant};
 
 const BODY_SIZE_LIMIT: u64 = 104857600; // bytes
-
-pub struct CachingClient<'a> {
-    client: SlowClient<'a>,
-    cache: &'a Cache,
-}
-
-impl<'a> CachingClient<'a> {
-    pub fn new(client: SlowClient<'a>, cache: &'a Cache) -> Self {
-        Self { client, cache }
-    }
-
-    pub fn client(&self) -> &SlowClient {
-        &self.client
-    }
-
-    pub async fn get(&mut self, u: &Url) -> Option<String> {
-        match self.cache.get(u).await {
-            Some(x) => x,
-            None => self.get_and_cache_from_web(u).await,
-        }
-        .ok()
-    }
-
-    async fn get_and_cache_from_web(&mut self, u: &Url) -> SerializableResponse {
-        let body = self.client.get(u).await;
-
-        // We would rather keep searching
-        // than panic
-        // or delay
-        // from failed caching.
-        let _ = self.cache.set(u, &body).await;
-
-        body
-    }
-}
 
 pub struct SlowClient<'a> {
     client: &'a reqwest::Client,

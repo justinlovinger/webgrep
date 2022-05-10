@@ -2,8 +2,8 @@ mod cache;
 mod client;
 mod node;
 
-use crate::cache::Cache;
-use crate::client::{CachingClient, SlowClient};
+use crate::cache::{Cache, SerializableResponse};
+use crate::client::SlowClient;
 use crate::node::{path_to_root, Node};
 use clap::Parser;
 use futures::future::FutureExt;
@@ -95,21 +95,17 @@ async fn main() -> Result<(), reqwest::Error> {
     // avoids simultaneous requests to a host.
     let mut host_clients = HashMap::new();
     let request_task = |host_clients: &mut HashMap<_, _>, p: Option<Arc<Node<Page>>>, u: Url| {
+        // TODO: only make client
+        // if `get_with_cache` needs it.
         let client_ = Arc::clone(
             host_clients
                 .entry(small_host_name(&u).to_owned())
                 .or_insert_with(|| {
-                    Arc::new(tokio::sync::Mutex::new(CachingClient::new(
-                        SlowClient::new(master_client),
-                        cache,
-                    )))
+                    Arc::new(tokio::sync::Mutex::new(SlowClient::new(master_client)))
                 }),
         );
         task::spawn(async move {
-            client_
-                .lock()
-                .await
-                .get(&u)
+            get_with_cache(cache, &client_, &u)
                 .await
                 .map(|body| Node::new(p, Page { url: u, body }))
         })
@@ -189,7 +185,7 @@ async fn main() -> Result<(), reqwest::Error> {
             Arc::strong_count(client) > 1
                 || client
                     .try_lock()
-                    .map_or(true, |x| x.client().time_remaining() > Duration::ZERO)
+                    .map_or(true, |x| x.time_remaining() > Duration::ZERO)
         });
 
         // Search may spend a long time between matches.
@@ -244,6 +240,43 @@ fn small_host_name(u: &Url) -> &str {
         Some(Ipv6(_)) => u.host_str().unwrap(),
         None => "",
     }
+}
+
+async fn get_with_cache<'a>(
+    cache: &Cache,
+    client: &tokio::sync::Mutex<SlowClient<'a>>,
+    u: &Url,
+) -> Option<String> {
+    match cache.get(u).await {
+        Some(x) => x,
+        None => {
+            let client = client.lock().await;
+            // Multiple tasks may wait to make the same request,
+            // so we should check the cache again
+            // after obtaining a lock.
+            match cache.get(u).await {
+                Some(x) => x,
+                None => get_and_cache_from_web(cache, client, u).await,
+            }
+        }
+    }
+    .ok()
+}
+
+async fn get_and_cache_from_web<'a, 'b>(
+    cache: &Cache,
+    mut client: tokio::sync::MutexGuard<'a, SlowClient<'b>>,
+    u: &Url,
+) -> SerializableResponse {
+    let body = client.get(u).await;
+
+    // We would rather keep searching
+    // than panic
+    // or delay
+    // from failed caching.
+    let _ = cache.set(u, &body).await;
+
+    body
 }
 
 // Like experimental `drain_filter`:
