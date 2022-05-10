@@ -6,6 +6,7 @@ use crate::cache::{Cache, SerializableResponse};
 use crate::client::SlowClient;
 use crate::node::{path_to_root, Node};
 use clap::Parser;
+use core::ops::DerefMut;
 use futures::future::FutureExt;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
@@ -95,8 +96,6 @@ async fn main() -> Result<(), reqwest::Error> {
     // avoids simultaneous requests to a host.
     let mut host_clients = HashMap::new();
     let request_task = |host_clients: &mut HashMap<_, _>, p, u| {
-        // TODO: only make client
-        // if `get_with_cache` needs it.
         let client_ = Arc::clone(
             host_clients
                 .entry(small_host_name(&u).to_owned())
@@ -105,9 +104,10 @@ async fn main() -> Result<(), reqwest::Error> {
                 }),
         );
         task::spawn(async move {
-            get_with_cache(cache, &client_, &u)
+            get_with_cache(cache, client_.lock().await.deref_mut(), &u)
                 .await
                 .map(|body| Node::new(p, Page { url: u, body }))
+                .ok()
         })
     };
     let mut request_tasks = args
@@ -145,13 +145,16 @@ async fn main() -> Result<(), reqwest::Error> {
 
         swap_retain_mut(
             |x: &mut task::JoinHandle<_>| match x.now_or_never() {
-                Some(Ok((mtext, murls))) => {
-                    if let Some(text) = mtext {
+                Some(Ok((match_data, children_data))) => {
+                    if let Some(text) = match_data {
                         let _ = werr.write_all(CLEAR_CODE);
                         let _ = werr.flush();
                         println!("{}", text);
                     };
-                    if let Some((node, urls)) = murls {
+                    if let Some((children, (node, urls))) = children_data {
+                        for node in children {
+                            nodes.push(node);
+                        }
                         for u in urls {
                             request_tasks.push(request_task(
                                 &mut host_clients,
@@ -172,7 +175,7 @@ async fn main() -> Result<(), reqwest::Error> {
             match nodes.pop() {
                 Some(node) => {
                     node_tasks.push(task::spawn(async move {
-                        parse_page(args.max_depth, re, exclude_urls_re, node)
+                        parse_page(cache, args.max_depth, re, exclude_urls_re, node)
                     }));
                 }
                 None => break,
@@ -244,28 +247,18 @@ fn small_host_name(u: &Url) -> &str {
 
 async fn get_with_cache<'a>(
     cache: &Cache,
-    client: &tokio::sync::Mutex<SlowClient<'a>>,
+    client: &mut SlowClient<'a>,
     u: &Url,
-) -> Option<String> {
+) -> SerializableResponse {
     match cache.get(u) {
         Some(x) => x,
-        None => {
-            let client = client.lock().await;
-            // Multiple tasks may wait to make the same request,
-            // so we should check the cache again
-            // after obtaining a lock.
-            match cache.get(u) {
-                Some(x) => x,
-                None => get_and_cache_from_web(cache, client, u).await,
-            }
-        }
+        None => get_and_cache_from_web(cache, client, u).await,
     }
-    .ok()
 }
 
-async fn get_and_cache_from_web<'a, 'b>(
+async fn get_and_cache_from_web<'a>(
     cache: &Cache,
-    mut client: tokio::sync::MutexGuard<'a, SlowClient<'b>>,
+    client: &mut SlowClient<'a>,
     u: &Url,
 ) -> SerializableResponse {
     let body = client.get(u).await;
@@ -294,20 +287,23 @@ where
     }
 }
 
+type RequestData = (Arc<Node<Page>>, Vec<Url>);
+
 #[allow(clippy::type_complexity)]
 fn parse_page(
+    cache: &Cache,
     max_depth: u64,
     re: &Regex,
     exclude_urls_re: &Option<Regex>,
     node: Node<Page>,
-) -> (Option<String>, Option<(Arc<Node<Page>>, Vec<Url>)>) {
+) -> (Option<String>, Option<(Vec<Node<Page>>, RequestData)>) {
     match html5ever::parse_document(RcDom::default(), Default::default())
         .from_utf8()
         .read_from(&mut node.value().body.as_bytes())
         .ok()
     {
         Some(dom) => {
-            let mtext = if re.is_match(&inner_text(&dom)) {
+            let match_data = if re.is_match(&inner_text(&dom)) {
                 // `map(...).intersperse(" > ")` would be better,
                 // but it is only available in nightly builds
                 // as of 2022-04-18.
@@ -322,29 +318,36 @@ fn parse_page(
                 None
             };
 
-            let mnodes = if node.depth() < max_depth {
+            let children_data = if node.depth() < max_depth {
                 let node_ = Arc::new(node);
                 let node_path: HashSet<_> = path_to_root(&node_).map(|x| &x.url).collect();
-                let urls = links(&node_.value().url, &dom)
+                let mut children = Vec::new();
+                let mut urls = Vec::new();
+                links(&node_.value().url, &dom)
                     .into_iter()
                     // We don't need to know if a path cycles back on itself.
                     // For us,
                     // path cycles waste time and lead to infinite loops.
-                    .filter(|x| !node_path.contains(&x))
+                    .filter(|u| !node_path.contains(&u))
                     // We're hoping the Rust compiler optimizes this branch
                     // out of the loop.
-                    .filter(|x| {
+                    .filter(|u| {
                         exclude_urls_re
                             .as_ref()
-                            .map_or(true, |re| !re.is_match(x.as_str()))
+                            .map_or(true, |re| !re.is_match(u.as_str()))
                     })
-                    .collect::<Vec<_>>();
-                Some((node_, urls))
+                    .for_each(|u| match cache.get(&u) {
+                        Some(Ok(body)) => children
+                            .push(Node::new(Some(Arc::clone(&node_)), Page { url: u, body })),
+                        Some(Err(_)) => {}
+                        None => urls.push(u),
+                    });
+                Some((children, (node_, urls)))
             } else {
                 None
             };
 
-            (mtext, mnodes)
+            (match_data, children_data)
         }
         None => (None, None),
     }
