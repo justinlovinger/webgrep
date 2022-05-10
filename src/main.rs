@@ -95,27 +95,36 @@ async fn main() -> Result<(), reqwest::Error> {
     // not FQDN.
     // Mutex locking each host client
     // avoids simultaneous requests to a host.
-    let mut host_clients = HashMap::new();
-    let request_task = |host_clients: &mut HashMap<_, _>, p, u| {
-        let client_ = Arc::clone(
-            host_clients
-                .entry(small_host_name(&u).to_owned())
-                .or_insert_with(|| {
-                    Arc::new(tokio::sync::Mutex::new(SlowClient::new(master_client)))
-                }),
-        );
-        task::spawn(async move {
-            get_with_cache(cache, client_.lock().await.deref_mut(), &u)
-                .await
-                .map(|body| Node::new(p, Page { url: u, body }))
-                .ok()
-        })
-    };
-    let mut request_tasks = args
-        .urls
+
+    // TODO: replace `Option<Task>` with `enum { Working<Task>, Waiting<Client> }`
+    // and pass `Client` back and forth
+    // instead of locking.
+    let mut host_resources = HashMap::new();
+    let add_url =
+        |host_resources: &mut HashMap<_, (BinaryHeap<_>, _, Option<task::JoinHandle<_>>)>, p, u| {
+            let host = small_host_name(&u);
+            match host_resources.get_mut(host) {
+                Some((urls, _, _)) => urls.push((p, u)),
+                None => {
+                    let host_string = host.to_owned();
+                    let mut urls = BinaryHeap::with_capacity(1);
+                    urls.push((p, u));
+                    host_resources.insert(
+                        host_string,
+                        (
+                            urls,
+                            // Mutex locking each host client
+                            // avoids simultaneous requests to a host.
+                            Arc::new(tokio::sync::Mutex::new(SlowClient::new(master_client))),
+                            Option::None,
+                        ),
+                    );
+                }
+            };
+        };
+    args.urls
         .into_iter()
-        .map(|x| request_task(&mut host_clients, None, x))
-        .collect();
+        .for_each(|u| add_url(&mut host_resources, None, u));
 
     let mut nodes = BinaryHeap::new();
     let mut node_tasks = Vec::with_capacity(node_buffer_size);
@@ -132,19 +141,6 @@ async fn main() -> Result<(), reqwest::Error> {
         // and search deeper nodes.
 
         swap_retain_mut(
-            |x| match x.now_or_never() {
-                Some(Ok(Some(node))) => {
-                    nodes.push(node);
-                    false
-                }
-                Some(Ok(None)) => false,
-                Some(Err(e)) => panic!("{}", e),
-                None => true,
-            },
-            &mut request_tasks,
-        );
-
-        swap_retain_mut(
             |x: &mut task::JoinHandle<_>| match x.now_or_never() {
                 Some(Ok((match_data, children_data))) => {
                     if let Some(text) = match_data {
@@ -157,11 +153,7 @@ async fn main() -> Result<(), reqwest::Error> {
                             nodes.push(node);
                         }
                         for u in urls {
-                            request_tasks.push(request_task(
-                                &mut host_clients,
-                                Some(Arc::clone(&node)),
-                                u,
-                            ));
+                            add_url(&mut host_resources, Some(Arc::clone(&node)), u);
                         }
                     };
                     false
@@ -171,6 +163,43 @@ async fn main() -> Result<(), reqwest::Error> {
             },
             &mut node_tasks,
         );
+
+        // Host clients can accumulate over time,
+        // but we only need actively used clients.
+        host_resources.retain(|_, (urls, client, task)| {
+            if let Some(x) = task
+                .take()
+                .and_then(|mut task| match (&mut task).now_or_never() {
+                    Some(Ok(Some(node))) => {
+                        nodes.push(node);
+                        None
+                    }
+                    Some(Ok(None)) => None,
+                    Some(Err(e)) => panic!("{}", e),
+                    None => Some(task),
+                })
+                .or_else(|| {
+                    urls.pop().map(|(p, u)| {
+                        let client_ = Arc::clone(client);
+                        task::spawn(async move {
+                            get_with_cache(cache, client_.lock().await.deref_mut(), &u)
+                                .await
+                                .map(|body| Node::new(p, Page { url: u, body }))
+                                .ok()
+                        })
+                    })
+                })
+            {
+                debug_assert!(task.is_none());
+                _ = task.insert(x);
+                true
+            } else {
+                debug_assert!(task.is_none() && urls.is_empty());
+                client
+                    .try_lock()
+                    .map_or(true, |x| x.time_remaining() > Duration::ZERO)
+            }
+        });
 
         while node_tasks.len() < node_buffer_size {
             match nodes.pop() {
@@ -183,26 +212,25 @@ async fn main() -> Result<(), reqwest::Error> {
             }
         }
 
-        // Host clients can accumulate over time,
-        // but we only need actively used clients.
-        host_clients.retain(|_, client| {
-            Arc::strong_count(client) > 1
-                || client
-                    .try_lock()
-                    .map_or(true, |x| x.time_remaining() > Duration::ZERO)
-        });
-
         // Search may spend a long time between matches.
         // We want to indicate progress,
         // but we don't want to clutter output.
         // Overflowing terminal width
         // may prevent clearing the line.
-        let progress_line = format!(
-            "request tasks: {:>2}, node tasks: {:>2}, nodes: {}",
-            request_tasks.len(),
-            node_tasks.len(),
-            nodes.len()
-        );
+        let progress_line = {
+            let (num_urls, num_request_tasks) = host_resources
+                .values()
+                .fold((0, 0), |(x, y), (urls, _, task)| {
+                    (x + urls.len(), y + task.as_ref().map_or(0, |_| 1))
+                });
+            format!(
+                "active requests: {:<2}, queued requests: {:<4}, pages searching: {:<2}, pages queued: {}",
+                num_request_tasks,
+                num_urls,
+                node_tasks.len(),
+                nodes.len()
+            )
+        };
         let _ = werr.write_all(CLEAR_CODE);
         let _ = match terminal_size::terminal_size() {
             Some((terminal_size::Width(w), _)) => {
@@ -215,7 +243,12 @@ async fn main() -> Result<(), reqwest::Error> {
         };
         let _ = werr.flush();
 
-        if nodes.is_empty() && node_tasks.is_empty() && request_tasks.is_empty() {
+        if nodes.is_empty()
+            && node_tasks.is_empty()
+            && host_resources
+                .values()
+                .all(|(urls, _, task)| urls.is_empty() && task.is_none())
+        {
             cache.flush().await.expect("Failed to flush cache");
             return Ok(());
         }
