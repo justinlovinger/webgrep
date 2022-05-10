@@ -83,7 +83,8 @@ async fn main() -> Result<(), reqwest::Error> {
     // Tokio uses number of CPU cores as default number of worker threads.
     // `tokio::runtime::Handle::current().metrics().num_workers()`
     // is only available in unstable Tokio.
-    let node_buffer_size = 2 * num_cpus::get();
+    // A larger buffer isn't necessary faster.
+    let node_buffer_size = num_cpus::get();
 
     // Making more than one request at a time
     // to a host
