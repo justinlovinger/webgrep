@@ -1,12 +1,18 @@
 use reqwest::Url;
 use std::path::{Path, PathBuf};
-use tokio::task;
 
 pub type SerializableResponse = Result<String, String>;
 
 pub struct Cache {
     tree: sled::Tree,
 }
+
+// `sled` `.get` may have to get from disk.
+// `sled` `.set` may have to write to disk.
+// However,
+// benchmarks show better performance
+// without `task::spawn_blocking`
+// or `task::block_in_place`.
 
 impl Cache {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -20,20 +26,22 @@ impl Cache {
         })
     }
 
-    pub async fn get(&self, u: &Url) -> Option<SerializableResponse> {
-        task::block_in_place(|| self.tree.get(u.as_str()))
+    pub fn get(&self, u: &Url) -> Option<SerializableResponse> {
+        self.tree
+            .get(u.as_str())
             .ok()
             .flatten()
             .and_then(|x| bincode::deserialize(&x).ok())
     }
 
-    pub async fn set(
+    pub fn set(
         &self,
         u: &Url,
         body: &SerializableResponse,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let val = bincode::serialize(body)?;
-        task::block_in_place(|| self.tree.insert(u.as_str(), val))
+        self.tree
+            .insert(u.as_str(), val)
             .map(|_| ())
             .map_err(|e| e.into())
     }

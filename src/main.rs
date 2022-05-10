@@ -247,14 +247,14 @@ async fn get_with_cache<'a>(
     client: &tokio::sync::Mutex<SlowClient<'a>>,
     u: &Url,
 ) -> Option<String> {
-    match cache.get(u).await {
+    match cache.get(u) {
         Some(x) => x,
         None => {
             let client = client.lock().await;
             // Multiple tasks may wait to make the same request,
             // so we should check the cache again
             // after obtaining a lock.
-            match cache.get(u).await {
+            match cache.get(u) {
                 Some(x) => x,
                 None => get_and_cache_from_web(cache, client, u).await,
             }
@@ -274,7 +274,7 @@ async fn get_and_cache_from_web<'a, 'b>(
     // than panic
     // or delay
     // from failed caching.
-    let _ = cache.set(u, &body).await;
+    let _ = cache.set(u, &body);
 
     body
 }
