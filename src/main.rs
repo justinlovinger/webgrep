@@ -1,12 +1,13 @@
 mod cache;
 mod client;
 mod node;
+mod task;
 
 use crate::cache::{Cache, SerializableResponse};
 use crate::client::SlowClient;
 use crate::node::{path_to_root, Node};
+use crate::task::RequestTask;
 use clap::Parser;
-use core::ops::DerefMut;
 use futures::future::FutureExt;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
@@ -20,7 +21,6 @@ use std::io;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task;
 use url::Host::{Domain, Ipv4, Ipv6};
 
 const CLEAR_CODE: &[u8] = b"\r\x1B[K";
@@ -93,35 +93,23 @@ async fn main() -> Result<(), reqwest::Error> {
     // Most websites host all subdomains together,
     // so we to limit requests by domain,
     // not FQDN.
-    // Mutex locking each host client
-    // avoids simultaneous requests to a host.
 
-    // TODO: replace `Option<Task>` with `enum { Working<Task>, Waiting<Client> }`
-    // and pass `Client` back and forth
-    // instead of locking.
     let mut host_resources = HashMap::new();
-    let add_url =
-        |host_resources: &mut HashMap<_, (BinaryHeap<_>, _, Option<task::JoinHandle<_>>)>, p, u| {
-            let host = small_host_name(&u);
-            match host_resources.get_mut(host) {
-                Some((urls, _, _)) => urls.push((p, u)),
-                None => {
-                    let host_string = host.to_owned();
-                    let mut urls = BinaryHeap::with_capacity(1);
-                    urls.push((p, u));
-                    host_resources.insert(
-                        host_string,
-                        (
-                            urls,
-                            // Mutex locking each host client
-                            // avoids simultaneous requests to a host.
-                            Arc::new(tokio::sync::Mutex::new(SlowClient::new(master_client))),
-                            Option::None,
-                        ),
-                    );
-                }
-            };
+    let add_url = |host_resources: &mut HashMap<_, (BinaryHeap<_>, RequestTask<_>)>, p, u| {
+        let host = small_host_name(&u);
+        match host_resources.get_mut(host) {
+            Some((urls, _)) => urls.push((p, u)),
+            None => {
+                let host_string = host.to_owned();
+                let mut urls = BinaryHeap::with_capacity(1);
+                urls.push((p, u));
+                host_resources.insert(
+                    host_string,
+                    (urls, RequestTask::new(SlowClient::new(master_client))),
+                );
+            }
         };
+    };
     args.urls
         .into_iter()
         .for_each(|u| add_url(&mut host_resources, None, u));
@@ -137,17 +125,13 @@ async fn main() -> Result<(), reqwest::Error> {
     let mut done_i = std::u16::MAX;
 
     loop {
-        // Despite the name,
-        // `now_or_never` doesn't make the `Future` return "never"
-        // if it doesn't return "now".
-
         // We want to finish tasks
         // before queuing new requests
         // to maximize throughput
         // and search deeper nodes.
 
         swap_retain_mut(
-            |x: &mut task::JoinHandle<_>| match x.now_or_never() {
+            |x: &mut tokio::task::JoinHandle<_>| match x.now_or_never() {
                 Some(Ok((match_data, children_data))) => {
                     if let Some(text) = match_data {
                         if progress_shown {
@@ -176,45 +160,32 @@ async fn main() -> Result<(), reqwest::Error> {
 
         // Host clients can accumulate over time,
         // but we only need actively used clients.
-        host_resources.retain(|_, (urls, client, task)| {
-            if let Some(x) = task
-                .take()
-                .and_then(|mut task| match (&mut task).now_or_never() {
-                    Some(Ok(Some(node))) => {
-                        nodes.push(node);
-                        None
-                    }
-                    Some(Ok(None)) => None,
-                    Some(Err(e)) => panic!("{}", e),
-                    None => Some(task),
-                })
-                .or_else(|| {
-                    urls.pop().map(|(p, u)| {
-                        let client_ = Arc::clone(client);
-                        task::spawn(async move {
-                            get_with_cache(cache, client_.lock().await.deref_mut(), &u)
-                                .await
-                                .map(|body| Node::new(p, Page { url: u, body }))
-                                .ok()
-                        })
-                    })
-                })
-            {
-                debug_assert!(task.is_none());
-                _ = task.insert(x);
-                true
-            } else {
-                debug_assert!(task.is_none() && urls.is_empty());
-                client
-                    .try_lock()
-                    .map_or(true, |x| x.time_remaining() > Duration::ZERO)
+        host_resources.retain(|_, (urls, task)| {
+            if let Some(Some(node)) = task.try_finish() {
+                nodes.push(node);
             }
+            task.try_start(|mut client| match urls.pop() {
+                Some((p, u)) => Ok(tokio::task::spawn(async move {
+                    (
+                        get_with_cache(cache, &mut client, &u)
+                            .await
+                            .map(|body| Node::new(p, Page { url: u, body }))
+                            .ok(),
+                        client,
+                    )
+                })),
+                None => Err(client),
+            });
+            task.is_working_or(|client| {
+                debug_assert!(urls.is_empty());
+                client.time_remaining() > Duration::ZERO
+            })
         });
 
         while node_tasks.len() < node_buffer_size {
             match nodes.pop() {
                 Some(node) => {
-                    node_tasks.push(task::spawn(async move {
+                    node_tasks.push(tokio::task::spawn(async move {
                         parse_page(cache, args.max_depth, re, exclude_urls_re, node)
                     }));
                 }
@@ -233,11 +204,18 @@ async fn main() -> Result<(), reqwest::Error> {
             // Overflowing terminal width
             // may prevent clearing the line.
             let progress_line = {
-                let (num_urls, num_request_tasks) = host_resources
-                    .values()
-                    .fold((0, 0), |(x, y), (urls, _, task)| {
-                        (x + urls.len(), y + task.as_ref().map_or(0, |_| 1))
-                    });
+                let (num_urls, num_request_tasks) =
+                    host_resources
+                        .values()
+                        .fold((0, 0), |(x, y), (urls, task)| {
+                            (
+                                x + urls.len(),
+                                match task {
+                                    RequestTask::Working(_) => y + 1,
+                                    _ => y,
+                                },
+                            )
+                        });
                 format!(
                     "active requests: {:<2}, queued requests: {:<4}, pages searching: {:<2}, pages queued: {}",
                     num_request_tasks,
@@ -271,7 +249,7 @@ async fn main() -> Result<(), reqwest::Error> {
                 && node_tasks.is_empty()
                 && host_resources
                     .values()
-                    .all(|(urls, _, task)| urls.is_empty() && task.is_none())
+                    .all(|(urls, task)| urls.is_empty() && task.is_waiting())
             {
                 cache.flush().await.expect("Failed to flush cache");
                 return Ok(());
@@ -282,7 +260,7 @@ async fn main() -> Result<(), reqwest::Error> {
         // If we never yield,
         // tasks may never get time to complete,
         // and the program may stall.
-        task::yield_now().await;
+        tokio::task::yield_now().await;
     }
 }
 
