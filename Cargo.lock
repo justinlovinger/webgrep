@@ -1573,6 +1573,7 @@ dependencies = [
  "num_cpus",
  "regex",
  "reqwest",
+ "serde",
  "sled",
  "terminal_size",
  "tokio",

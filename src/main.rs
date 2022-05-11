@@ -3,8 +3,8 @@ mod client;
 mod node;
 mod task;
 
-use crate::cache::{Cache, SerializableResponse};
-use crate::client::SlowClient;
+use crate::cache::Cache;
+use crate::client::{SerializableResponse, SlowClient};
 use crate::node::{path_to_root, Node};
 use crate::task::TaskWithResource;
 use clap::Parser;
@@ -77,7 +77,9 @@ async fn main() -> Result<(), reqwest::Error> {
     ));
 
     let cache: &'static _ = Box::leak(Box::new(
-        Cache::new().await.expect("Failed to initialize cache"),
+        Cache::new("page-cache")
+            .await
+            .expect("Failed to initialize cache"),
     ));
 
     // Tokio uses number of CPU cores as default number of worker threads.
@@ -279,7 +281,7 @@ fn small_host_name(u: &Url) -> &str {
 }
 
 async fn get_with_cache<'a>(
-    cache: &Cache,
+    cache: &Cache<Url, SerializableResponse>,
     client: &mut SlowClient<'a>,
     u: &Url,
 ) -> SerializableResponse {
@@ -290,7 +292,7 @@ async fn get_with_cache<'a>(
 }
 
 async fn get_and_cache_from_web<'a>(
-    cache: &Cache,
+    cache: &Cache<Url, SerializableResponse>,
     client: &mut SlowClient<'a>,
     u: &Url,
 ) -> SerializableResponse {
@@ -324,7 +326,7 @@ type RequestData = (Arc<Node<Page>>, Vec<Url>);
 
 #[allow(clippy::type_complexity)]
 fn parse_page(
-    cache: &Cache,
+    cache: &Cache<Url, SerializableResponse>,
     max_depth: u64,
     re: &Regex,
     exclude_urls_re: &Option<Regex>,

@@ -1,8 +1,9 @@
-use crate::cache::SerializableResponse;
 use reqwest::Url;
 use std::time::{Duration, Instant};
 
 const BODY_SIZE_LIMIT: u64 = 104857600; // bytes
+
+pub type SerializableResponse = Result<String, String>;
 
 pub struct SlowClient<'a> {
     client: &'a reqwest::Client,

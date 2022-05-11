@@ -18,6 +18,7 @@ markup5ever_rcdom = "0.1"
 num_cpus = "1"
 regex = "1"
 reqwest = "0.11"
+serde = "1"
 sled = "0.34"
 terminal_size = "0.1"
 tokio = { version = "1", features = ["full"] }
