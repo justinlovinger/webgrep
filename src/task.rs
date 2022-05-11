@@ -1,63 +1,60 @@
-use crate::client::SlowClient;
 use futures::future::FutureExt;
 
-pub enum RequestTask<'a, T> {
-    Working(tokio::task::JoinHandle<(T, SlowClient<'a>)>),
-    Waiting(Option<SlowClient<'a>>),
+pub enum TaskWithResource<T, R> {
+    Working(tokio::task::JoinHandle<(T, R)>),
+    Waiting(Option<R>),
 }
 
-impl<'a, T> RequestTask<'a, T> {
-    pub fn new(client: SlowClient<'a>) -> Self {
-        RequestTask::Waiting(Some(client))
+impl<T, R> TaskWithResource<T, R> {
+    pub fn new(r: R) -> Self {
+        TaskWithResource::Waiting(Some(r))
     }
 
     pub fn try_start<F>(&mut self, f: F)
     where
-        F: FnOnce(
-            SlowClient<'a>,
-        ) -> Result<tokio::task::JoinHandle<(T, SlowClient<'a>)>, SlowClient<'a>>,
+        F: FnOnce(R) -> Result<tokio::task::JoinHandle<(T, R)>, R>,
     {
-        if let RequestTask::Waiting(client) = self {
-            let client_ = client
+        if let TaskWithResource::Waiting(r) = self {
+            let r_ = r
                 .take()
-                .expect("`RequestTask` client invariant failed in `try_start`");
-            match f(client_) {
-                Ok(handle) => *self = RequestTask::Working(handle),
-                Err(c) => *self = RequestTask::Waiting(Some(c)),
+                .expect("`TaskWithResource` resource invariant failed in `try_start`");
+            match f(r_) {
+                Ok(handle) => *self = TaskWithResource::Working(handle),
+                Err(c) => *self = TaskWithResource::Waiting(Some(c)),
             }
         }
     }
 
     pub fn try_finish(&mut self) -> Option<T> {
         match self {
-            RequestTask::Working(handle) => match handle.now_or_never() {
-                Some(Ok((x, client))) => {
-                    *self = RequestTask::Waiting(Some(client));
+            TaskWithResource::Working(handle) => match handle.now_or_never() {
+                Some(Ok((x, r))) => {
+                    *self = TaskWithResource::Waiting(Some(r));
                     Some(x)
                 }
-                Some(Err(e)) => panic!("`RequestTask` failed: {}", e),
+                Some(Err(e)) => panic!("`TaskWithResource` failed: {}", e),
                 None => None,
             },
-            RequestTask::Waiting(_) => None,
+            TaskWithResource::Waiting(_) => None,
         }
     }
 
     pub fn is_working_or<F>(&self, f: F) -> bool
     where
-        F: Fn(&SlowClient<'a>) -> bool,
+        F: Fn(&R) -> bool,
     {
         match self {
-            RequestTask::Working(_) => true,
-            RequestTask::Waiting(client) => f(client
+            TaskWithResource::Working(_) => true,
+            TaskWithResource::Waiting(r) => f(r
                 .as_ref()
-                .expect("`RequestTask` client invariant failed in `is_working_or`")),
+                .expect("`TaskWithResource` resource invariant failed in `is_working_or`")),
         }
     }
 
     pub fn is_waiting(&self) -> bool {
         match self {
-            RequestTask::Working(_) => false,
-            RequestTask::Waiting(_) => true,
+            TaskWithResource::Working(_) => false,
+            TaskWithResource::Waiting(_) => true,
         }
     }
 }

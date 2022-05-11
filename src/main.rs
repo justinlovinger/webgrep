@@ -6,7 +6,7 @@ mod task;
 use crate::cache::{Cache, SerializableResponse};
 use crate::client::SlowClient;
 use crate::node::{path_to_root, Node};
-use crate::task::RequestTask;
+use crate::task::TaskWithResource;
 use clap::Parser;
 use futures::future::FutureExt;
 use html5ever::tendril::TendrilSink;
@@ -95,21 +95,22 @@ async fn main() -> Result<(), reqwest::Error> {
     // not FQDN.
 
     let mut host_resources = HashMap::new();
-    let add_url = |host_resources: &mut HashMap<_, (BinaryHeap<_>, RequestTask<_>)>, p, u| {
-        let host = small_host_name(&u);
-        match host_resources.get_mut(host) {
-            Some((urls, _)) => urls.push((p, u)),
-            None => {
-                let host_string = host.to_owned();
-                let mut urls = BinaryHeap::with_capacity(1);
-                urls.push((p, u));
-                host_resources.insert(
-                    host_string,
-                    (urls, RequestTask::new(SlowClient::new(master_client))),
-                );
-            }
+    let add_url =
+        |host_resources: &mut HashMap<_, (BinaryHeap<_>, TaskWithResource<_, _>)>, p, u| {
+            let host = small_host_name(&u);
+            match host_resources.get_mut(host) {
+                Some((urls, _)) => urls.push((p, u)),
+                None => {
+                    let host_string = host.to_owned();
+                    let mut urls = BinaryHeap::with_capacity(1);
+                    urls.push((p, u));
+                    host_resources.insert(
+                        host_string,
+                        (urls, TaskWithResource::new(SlowClient::new(master_client))),
+                    );
+                }
+            };
         };
-    };
     args.urls
         .into_iter()
         .for_each(|u| add_url(&mut host_resources, None, u));
@@ -208,13 +209,7 @@ async fn main() -> Result<(), reqwest::Error> {
                     host_resources
                         .values()
                         .fold((0, 0), |(x, y), (urls, task)| {
-                            (
-                                x + urls.len(),
-                                match task {
-                                    RequestTask::Working(_) => y + 1,
-                                    _ => y,
-                                },
-                            )
+                            (x + urls.len(), if task.is_waiting() { y } else { y + 1 })
                         });
                 format!(
                     "active requests: {:<2}, queued requests: {:<4}, pages searching: {:<2}, pages queued: {}",
