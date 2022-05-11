@@ -1,41 +1,40 @@
 use futures::future::FutureExt;
 
-pub enum TaskWithResource<T, R> {
-    Working(tokio::task::JoinHandle<(T, R)>),
-    Waiting(Option<R>),
-}
+pub struct TaskWithResource<T, R>(Option<InnerTaskWithResource<T, R>>);
 
 impl<T, R> TaskWithResource<T, R> {
     pub fn new(r: R) -> Self {
-        TaskWithResource::Waiting(Some(r))
+        Self(Some(InnerTaskWithResource::Waiting(r)))
     }
 
     pub fn try_start<F>(&mut self, f: F)
     where
         F: FnOnce(R) -> Result<tokio::task::JoinHandle<(T, R)>, R>,
     {
-        if let TaskWithResource::Waiting(r) = self {
-            let r_ = r
-                .take()
-                .expect("`TaskWithResource` resource invariant failed in `try_start`");
-            match f(r_) {
-                Ok(handle) => *self = TaskWithResource::Working(handle),
-                Err(c) => *self = TaskWithResource::Waiting(Some(c)),
+        match self.0.take() {
+            Some(InnerTaskWithResource::Working(handle)) => {
+                self.0 = Some(InnerTaskWithResource::Working(handle))
             }
+            Some(InnerTaskWithResource::Waiting(r)) => match f(r) {
+                Ok(handle) => self.0 = Some(InnerTaskWithResource::Working(handle)),
+                Err(r_) => self.0 = Some(InnerTaskWithResource::Waiting(r_)),
+            },
+            None => panic!("Resource invariant failed in `TaskWithResource::try_start`"),
         }
     }
 
     pub fn try_finish(&mut self) -> Option<T> {
-        match self {
-            TaskWithResource::Working(handle) => match handle.now_or_never() {
+        match &mut self.0 {
+            Some(InnerTaskWithResource::Working(handle)) => match handle.now_or_never() {
                 Some(Ok((x, r))) => {
-                    *self = TaskWithResource::Waiting(Some(r));
+                    self.0 = Some(InnerTaskWithResource::Waiting(r));
                     Some(x)
                 }
                 Some(Err(e)) => panic!("`TaskWithResource` failed: {}", e),
                 None => None,
             },
-            TaskWithResource::Waiting(_) => None,
+            Some(InnerTaskWithResource::Waiting(_)) => None,
+            None => panic!("Resource invariant failed in `TaskWithResource::try_finish`"),
         }
     }
 
@@ -43,18 +42,23 @@ impl<T, R> TaskWithResource<T, R> {
     where
         F: Fn(&R) -> bool,
     {
-        match self {
-            TaskWithResource::Working(_) => true,
-            TaskWithResource::Waiting(r) => f(r
-                .as_ref()
-                .expect("`TaskWithResource` resource invariant failed in `is_working_or`")),
+        match &self.0 {
+            Some(InnerTaskWithResource::Working(_)) => true,
+            Some(InnerTaskWithResource::Waiting(r)) => f(r),
+            None => panic!("Resource invariant failed in `TaskWithResource::is_working_or`"),
         }
     }
 
     pub fn is_waiting(&self) -> bool {
-        match self {
-            TaskWithResource::Working(_) => false,
-            TaskWithResource::Waiting(_) => true,
+        match &self.0 {
+            Some(InnerTaskWithResource::Working(_)) => false,
+            Some(InnerTaskWithResource::Waiting(_)) => true,
+            None => panic!("Resource invariant failed in `TaskWithResource::is_waiting`"),
         }
     }
+}
+
+enum InnerTaskWithResource<T, R> {
+    Working(tokio::task::JoinHandle<(T, R)>),
+    Waiting(R),
 }
