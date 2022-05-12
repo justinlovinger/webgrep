@@ -4,7 +4,7 @@ mod node;
 mod task;
 
 use crate::cache::Cache;
-use crate::client::{SerializableResponse, SlowClient};
+use crate::client::{Body, Response, SlowClient};
 use crate::node::{path_to_root, Node};
 use crate::task::TaskWithResource;
 use clap::Parser;
@@ -27,7 +27,7 @@ const CLEAR_CODE: &[u8] = b"\r\x1B[K";
 
 struct Page {
     url: Url,
-    body: String,
+    body: Body,
 }
 
 #[derive(Parser)]
@@ -281,10 +281,10 @@ fn small_host_name(u: &Url) -> &str {
 }
 
 async fn get_with_cache<'a>(
-    cache: &Cache<Url, SerializableResponse>,
+    cache: &Cache<Url, Response>,
     client: &mut SlowClient<'a>,
     u: &Url,
-) -> SerializableResponse {
+) -> Response {
     match cache.get(u) {
         Some(x) => x,
         None => get_and_cache_from_web(cache, client, u).await,
@@ -292,10 +292,10 @@ async fn get_with_cache<'a>(
 }
 
 async fn get_and_cache_from_web<'a>(
-    cache: &Cache<Url, SerializableResponse>,
+    cache: &Cache<Url, Response>,
     client: &mut SlowClient<'a>,
     u: &Url,
-) -> SerializableResponse {
+) -> Response {
     let body = client.get(u).await;
 
     // We would rather keep searching
@@ -326,66 +326,75 @@ type RequestData = (Arc<Node<Page>>, Vec<Url>);
 
 #[allow(clippy::type_complexity)]
 fn parse_page(
-    cache: &Cache<Url, SerializableResponse>,
+    cache: &Cache<Url, Response>,
     max_depth: u64,
     re: &Regex,
     exclude_urls_re: &Option<Regex>,
     node: Node<Page>,
 ) -> (Option<String>, Option<(Vec<Node<Page>>, RequestData)>) {
-    match html5ever::parse_document(RcDom::default(), Default::default())
-        .from_utf8()
-        .read_from(&mut node.value().body.as_bytes())
-        .ok()
-    {
-        Some(dom) => {
-            let match_data = if re.is_match(&inner_text(&dom)) {
-                // `map(...).intersperse(" > ")` would be better,
-                // but it is only available in nightly builds
-                // as of 2022-04-18.
-                Some(
-                    node.path_from_root()
-                        .iter()
-                        .map(|x| x.url.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" > "),
-                )
-            } else {
-                None
-            };
+    match &node.value().body {
+        Body::Html(body) => {
+            match html5ever::parse_document(RcDom::default(), Default::default())
+                .from_utf8()
+                .read_from(&mut body.as_bytes())
+                .ok()
+            {
+                Some(dom) => {
+                    let match_data = re
+                        .is_match(&inner_text(&dom))
+                        .then(|| display_node_path(&node));
 
-            let children_data = if node.depth() < max_depth {
-                let node_ = Arc::new(node);
-                let node_path: HashSet<_> = path_to_root(&node_).map(|x| &x.url).collect();
-                let mut children = Vec::new();
-                let mut urls = Vec::new();
-                links(&node_.value().url, &dom)
-                    .into_iter()
-                    // We don't need to know if a path cycles back on itself.
-                    // For us,
-                    // path cycles waste time and lead to infinite loops.
-                    .filter(|u| !node_path.contains(&u))
-                    // We're hoping the Rust compiler optimizes this branch
-                    // out of the loop.
-                    .filter(|u| {
-                        exclude_urls_re
-                            .as_ref()
-                            .map_or(true, |re| !re.is_match(u.as_str()))
-                    })
-                    .for_each(|u| match cache.get(&u) {
-                        Some(Ok(body)) => children
-                            .push(Node::new(Some(Arc::clone(&node_)), Page { url: u, body })),
-                        Some(Err(_)) => {}
-                        None => urls.push(u),
-                    });
-                Some((children, (node_, urls)))
-            } else {
-                None
-            };
+                    let children_data = if node.depth() < max_depth {
+                        let node_ = Arc::new(node);
+                        let node_path: HashSet<_> = path_to_root(&node_).map(|x| &x.url).collect();
+                        let mut children = Vec::new();
+                        let mut urls = Vec::new();
+                        links(&node_.value().url, &dom)
+                            .into_iter()
+                            // We don't need to know if a path cycles back on itself.
+                            // For us,
+                            // path cycles waste time and lead to infinite loops.
+                            .filter(|u| !node_path.contains(&u))
+                            // We're hoping the Rust compiler optimizes this branch
+                            // out of the loop.
+                            .filter(|u| {
+                                exclude_urls_re
+                                    .as_ref()
+                                    .map_or(true, |re| !re.is_match(u.as_str()))
+                            })
+                            .for_each(|u| match cache.get(&u) {
+                                Some(Ok(body)) => children.push(Node::new(
+                                    Some(Arc::clone(&node_)),
+                                    Page { url: u, body },
+                                )),
+                                Some(Err(_)) => {}
+                                None => urls.push(u),
+                            });
+                        Some((children, (node_, urls)))
+                    } else {
+                        None
+                    };
 
-            (match_data, children_data)
+                    (match_data, children_data)
+                }
+                None => (None, None),
+            }
         }
-        None => (None, None),
+        // TODO: decompress PDF if necessary.
+        Body::Pdf(raw) => (re.is_match(raw).then(|| display_node_path(&node)), None),
+        Body::Plain(text) => (re.is_match(text).then(|| display_node_path(&node)), None),
     }
+}
+
+fn display_node_path(node: &Node<Page>) -> String {
+    // `map(...).intersperse(" > ")` would be better,
+    // but it is only available in nightly builds,
+    // as of 2022-04-18.
+    node.path_from_root()
+        .iter()
+        .map(|x| x.url.as_str())
+        .collect::<Vec<_>>()
+        .join(" > ")
 }
 
 fn inner_text(dom: &RcDom) -> String {
