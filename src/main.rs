@@ -9,8 +9,6 @@ use crate::node::{path_to_root, Node};
 use crate::task::TaskWithResource;
 use clap::Parser;
 use futures::future::FutureExt;
-use html5ever::tendril::TendrilSink;
-use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use regex::{Regex, RegexBuilder};
 use reqwest::Url;
 use std::collections::BinaryHeap;
@@ -332,20 +330,30 @@ fn parse_page(
     exclude_urls_re: &Option<Regex>,
     node: Node<Page>,
 ) -> (Option<String>, Option<(Vec<Node<Page>>, RequestData)>) {
-    match &node.value().body {
+    let node_ = Arc::new(node);
+    match &node_.value().body {
         Body::Html(body) => {
-            match html5ever::parse_document(RcDom::default(), Default::default())
-                .from_utf8()
-                .read_from(&mut body.as_bytes())
-                .ok()
-            {
-                Some(dom) => {
-                    let match_data = re
-                        .is_match(&inner_text(&dom))
-                        .then(|| display_node_path(&node));
+            match tl::parse(body, tl::ParserOptions::default()) {
+                Ok(dom) => {
+                    // Matches may span DOM nodes,
+                    // so we can't just check DOM nodes individually.
+                    let match_data = if re.is_match(&inner_text(&dom)) {
+                        // `map(...).intersperse(" > ")` would be better,
+                        // but it is only available in nightly builds
+                        // as of 2022-04-18.
+                        Some(
+                            node_
+                                .path_from_root()
+                                .iter()
+                                .map(|x| x.url.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" > "),
+                        )
+                    } else {
+                        None
+                    };
 
-                    let children_data = if node.depth() < max_depth {
-                        let node_ = Arc::new(node);
+                    let children_data = if node_.depth() < max_depth {
                         let node_path: HashSet<_> = path_to_root(&node_).map(|x| &x.url).collect();
                         let mut children = Vec::new();
                         let mut urls = Vec::new();
@@ -370,19 +378,19 @@ fn parse_page(
                                 Some(Err(_)) => {}
                                 None => urls.push(u),
                             });
-                        Some((children, (node_, urls)))
+                        Some((children, (Arc::clone(&node_), urls)))
                     } else {
                         None
                     };
 
                     (match_data, children_data)
                 }
-                None => (None, None),
+                Err(_) => (None, None),
             }
         }
         // TODO: decompress PDF if necessary.
-        Body::Pdf(raw) => (re.is_match(raw).then(|| display_node_path(&node)), None),
-        Body::Plain(text) => (re.is_match(text).then(|| display_node_path(&node)), None),
+        Body::Pdf(raw) => (re.is_match(raw).then(|| display_node_path(&node_)), None),
+        Body::Plain(text) => (re.is_match(text).then(|| display_node_path(&node_)), None),
     }
 }
 
@@ -397,68 +405,48 @@ fn display_node_path(node: &Node<Page>) -> String {
         .join(" > ")
 }
 
-fn inner_text(dom: &RcDom) -> String {
-    let mut text = String::new();
-    walk_dom(
-        &mut |data| {
-            match data {
-                NodeData::Text { ref contents } => {
-                    text.push_str(contents.borrow().to_string().as_str());
-                }
-                NodeData::Element { ref name, .. } => {
-                    // The contents of script tags are invisible
-                    // and shouldn't be searched.
-                    if name.local.as_ref() == "script" {
-                        return false;
+fn inner_text(dom: &tl::VDom) -> String {
+    fn inner_text_(parser: &tl::Parser, s: &mut String, node: &tl::NodeHandle) {
+        match node.get(parser).unwrap() {
+            tl::Node::Tag(t) => {
+                // The contents of script tags are invisible
+                // and shouldn't be searched.
+                if t.name() != "script" {
+                    for child in t.children().top().iter() {
+                        inner_text_(parser, s, child);
                     }
                 }
-                _ => {}
             }
-            true
-        },
-        &dom.document,
-    );
-    text
+            tl::Node::Raw(e) => s.push_str(&e.as_utf8_str()),
+            tl::Node::Comment(_) => {}
+        }
+    }
+
+    let mut s = String::new();
+    let parser = dom.parser();
+    for child in dom.children() {
+        inner_text_(parser, &mut s, child);
+    }
+    s
 }
 
 // We only want unique links.
 // `HashSet` takes care of this.
-fn links(origin: &Url, dom: &RcDom) -> HashSet<Url> {
-    let mut xs = HashSet::new();
-    walk_dom(
-        &mut |data| {
-            if let NodeData::Element {
-                ref name,
-                ref attrs,
-                ..
-            } = data
-            {
-                if name.local.as_ref() == "a" {
-                    attrs
-                        .borrow()
-                        .iter()
-                        .filter(|x| x.name.local.as_ref() == "href")
-                        .take(1) // An `a` tag shouldn't have more than one `href`
-                        .filter_map(|x| origin.join(&x.value).ok())
-                        .for_each(|x| {
-                            xs.insert(x);
-                        });
+fn links(origin: &Url, dom: &tl::VDom) -> HashSet<Url> {
+    let mut link_set = HashSet::new();
+    for node in dom.nodes() {
+        if let tl::Node::Tag(t) = node {
+            if t.name() == "a" || t.name() == "A" {
+                if let Some(link) = t
+                    .attributes()
+                    .get("href")
+                    .flatten()
+                    .and_then(|x| origin.join(&x.as_utf8_str()).ok())
+                {
+                    link_set.insert(link);
                 }
             }
-            true
-        },
-        &dom.document,
-    );
-    xs
-}
-
-fn walk_dom<F>(f: &mut F, handle: &Handle)
-where
-    F: FnMut(&NodeData) -> bool,
-{
-    if f(&handle.data) {
-        for child in handle.children.borrow().iter() {
-            walk_dom(f, child);
         }
     }
+    link_set
 }
