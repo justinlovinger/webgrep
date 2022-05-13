@@ -111,12 +111,15 @@ async fn main() -> Result<(), reqwest::Error> {
                 }
             };
         };
-    args.urls
-        .into_iter()
-        .for_each(|u| add_url(&mut host_resources, None, u));
 
     let mut nodes = BinaryHeap::new();
     let mut node_tasks = Vec::with_capacity(node_buffer_size);
+
+    args.urls.into_iter().for_each(|u| match cache.get(&u) {
+        Some(Ok(body)) => nodes.push(Node::new(None, Page { url: u, body })),
+        Some(Err(_)) => {}
+        None => add_url(&mut host_resources, None, u),
+    });
 
     // TODO: use async IO.
     let mut werr = io::BufWriter::new(io::stderr());
