@@ -95,7 +95,6 @@ async fn main() -> Result<(), reqwest::Error> {
     // Most websites host all subdomains together,
     // so we to limit requests by domain,
     // not FQDN.
-
     let mut host_resources = HashMap::new();
     let add_url =
         |host_resources: &mut HashMap<_, (BinaryHeap<_>, TaskWithResource<_, _>)>, p, u| {
@@ -342,6 +341,8 @@ fn parse_page(
                 .ok()
             {
                 Some(dom) => {
+                    // Matches may span DOM nodes,
+                    // so we can't just check DOM nodes individually.
                     let match_data = re
                         .is_match(&inner_text(&dom))
                         .then(|| display_node_path(&node));
@@ -400,12 +401,12 @@ fn display_node_path(node: &Node<Page>) -> String {
 }
 
 fn inner_text(dom: &RcDom) -> String {
-    let mut text = String::new();
+    let mut s = String::new();
     walk_dom(
         &mut |data| {
             match data {
                 NodeData::Text { ref contents } => {
-                    text.push_str(contents.borrow().to_string().as_str());
+                    s.push_str(contents.borrow().to_string().as_str());
                 }
                 NodeData::Element { ref name, .. } => {
                     // The contents of script tags are invisible
@@ -420,7 +421,7 @@ fn inner_text(dom: &RcDom) -> String {
         },
         &dom.document,
     );
-    text
+    s
 }
 
 // We only want unique links.
