@@ -17,10 +17,10 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::default::Default;
-use std::io;
-use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io;
+use tokio::io::AsyncWriteExt;
 use url::Host::{Domain, Ipv4, Ipv6};
 
 const CLEAR_CODE: &[u8] = b"\r\x1B[K";
@@ -55,7 +55,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), reqwest::Error> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let re: &'static _ = Box::leak(Box::new(
@@ -122,12 +122,12 @@ async fn main() -> Result<(), reqwest::Error> {
         None => add_url(&mut host_resources, None, u),
     });
 
-    // TODO: use async IO.
+    let mut wout = io::BufWriter::new(io::stdout());
+    let mut match_buffer = Vec::new();
     let mut werr = io::BufWriter::new(io::stderr());
-    let mut progress_i = std::u8::MAX;
-    let mut progress_shown = false;
+    let mut print_i = std::u8::MAX;
 
-    let mut done_i = std::u16::MAX;
+    let mut done_i = std::u8::MAX;
 
     loop {
         // We want to finish tasks
@@ -138,14 +138,8 @@ async fn main() -> Result<(), reqwest::Error> {
         swap_retain_mut(
             |x: &mut tokio::task::JoinHandle<_>| match x.now_or_never() {
                 Some(Ok((match_data, children_data))) => {
-                    if let Some(text) = match_data {
-                        if progress_shown {
-                            let _ = werr.write_all(CLEAR_CODE);
-                            let _ = werr.flush();
-                            progress_shown = false;
-                        }
-                        // TODO: use async IO.
-                        println!("{}", text);
+                    if let Some(s) = match_data {
+                        match_buffer.push(s);
                     };
                     if let Some((children, (node, urls))) = children_data {
                         for node in children {
@@ -200,8 +194,20 @@ async fn main() -> Result<(), reqwest::Error> {
 
         // We don't need to print progress
         // as often as we need to coordinate tasks.
-        if !progress_shown || progress_i > 100 {
-            progress_i = 0;
+        if print_i > 100 {
+            print_i = 0;
+
+            let _ = werr.write_all(CLEAR_CODE).await;
+
+            if !match_buffer.is_empty() {
+                let _ = werr.flush().await;
+
+                for s in match_buffer.drain(..) {
+                    wout.write_all(s.as_bytes()).await?;
+                    wout.write_all(b"\n").await?;
+                }
+                wout.flush().await?;
+            }
 
             // Search may spend a long time between matches.
             // We want to indicate progress,
@@ -223,7 +229,6 @@ async fn main() -> Result<(), reqwest::Error> {
                     nodes.len()
                 )
             };
-            let _ = werr.write_all(CLEAR_CODE);
             let _ = match terminal_size::terminal_size() {
                 Some((terminal_size::Width(w), _)) => {
                     let s = progress_line.as_bytes();
@@ -232,33 +237,36 @@ async fn main() -> Result<(), reqwest::Error> {
                     werr.write_all(unsafe { s.get_unchecked(..std::cmp::min(s.len(), w.into())) })
                 }
                 None => werr.write_all(progress_line.as_bytes()),
-            };
-            let _ = werr.flush();
-            progress_shown = true;
-        }
-        progress_i += 1;
-
-        // Completion only matters once.
-        // We don't need to check often,
-        // and loops will occur faster
-        // without any tasks.
-        if done_i >= 1000 {
-            done_i = 0;
-            if nodes.is_empty()
-                && node_tasks.is_empty()
-                && host_resources
-                    .values()
-                    .all(|(urls, task)| urls.is_empty() && task.is_waiting())
-            {
-                return Ok(());
             }
-        }
-        done_i += 1;
+            .await;
+            let _ = werr.flush().await;
 
-        // If we never yield,
-        // tasks may never get time to complete,
-        // and the program may stall.
-        tokio::task::yield_now().await;
+            // We always want to print
+            // before completion.
+            //
+            // Completion only matters once.
+            // We don't need to check often,
+            // and loops will occur faster
+            // without any tasks.
+            if done_i >= 10 {
+                done_i = 0;
+                if nodes.is_empty()
+                    && node_tasks.is_empty()
+                    && host_resources
+                        .values()
+                        .all(|(urls, task)| urls.is_empty() && task.is_waiting())
+                {
+                    return Ok(());
+                }
+            }
+            done_i += 1;
+        } else {
+            // If we never yield,
+            // tasks may never get time to complete,
+            // and the program may stall.
+            tokio::task::yield_now().await;
+        }
+        print_i += 1;
     }
 }
 
