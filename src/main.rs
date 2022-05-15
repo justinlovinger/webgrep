@@ -409,9 +409,9 @@ fn inner_text(dom: &RcDom) -> String {
                     s.push_str(contents.borrow().to_string().as_str());
                 }
                 NodeData::Element { ref name, .. } => {
-                    // The contents of script tags are invisible
-                    // and shouldn't be searched.
-                    if name.local.as_ref() == "script" {
+                    // We want to search like a person viewing the page,
+                    // so we ignore invisible tags.
+                    if ["head", "script"].contains(&name.local.as_ref()) {
                         return false;
                     }
                 }
