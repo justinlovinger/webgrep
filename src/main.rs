@@ -406,7 +406,7 @@ fn inner_text(dom: &RcDom) -> String {
         &mut |data| {
             match data {
                 NodeData::Text { ref contents } => {
-                    s.push_str(contents.borrow().to_string().as_str());
+                    s.push_str(contents.borrow().as_ref());
                 }
                 NodeData::Element { ref name, .. } => {
                     // We want to search like a person viewing the page,
