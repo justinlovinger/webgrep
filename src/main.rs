@@ -405,10 +405,10 @@ fn inner_text(dom: &RcDom) -> String {
     walk_dom(
         &mut |data| {
             match data {
-                NodeData::Text { ref contents } => {
+                NodeData::Text { contents } => {
                     s.push_str(contents.borrow().as_ref());
                 }
-                NodeData::Element { ref name, .. } => {
+                NodeData::Element { name, .. } => {
                     // We want to search like a person viewing the page,
                     // so we ignore invisible tags.
                     if ["head", "script"].contains(&name.local.as_ref()) {
@@ -430,12 +430,7 @@ fn links(origin: &Url, dom: &RcDom) -> HashSet<Url> {
     let mut xs = HashSet::new();
     walk_dom(
         &mut |data| {
-            if let NodeData::Element {
-                ref name,
-                ref attrs,
-                ..
-            } = data
-            {
+            if let NodeData::Element { name, attrs, .. } = data {
                 if name.local.as_ref() == "a" {
                     attrs
                         .borrow()
