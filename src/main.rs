@@ -460,6 +460,13 @@ where
     F: FnMut(&NodeData) -> bool,
 {
     if f(&handle.data) {
+        if let NodeData::Element {
+            template_contents: Some(inner),
+            ..
+        } = &handle.data
+        {
+            walk_dom(f, inner);
+        }
         for child in handle.children.borrow().iter() {
             walk_dom(f, child);
         }
