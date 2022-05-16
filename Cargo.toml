@@ -19,7 +19,6 @@ num_cpus = "1"
 regex = "1"
 reqwest = "0.11"
 serde = { version = "1", features = ["derive"] }
-sled = "0.34"
 terminal_size = "0.1"
 tokio = { version = "1", features = ["full"] }
 url = "2"
