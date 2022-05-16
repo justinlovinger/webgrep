@@ -17,13 +17,13 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::default::Default;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io;
-use tokio::io::AsyncWriteExt;
 use url::Host::{Domain, Ipv4, Ipv6};
 
-const CLEAR_CODE: &[u8] = b"\r\x1B[K";
+type ParseResult = (Option<String>, Option<(Vec<Node<Page>>, u64, RequestData)>);
+type RequestData = (Arc<Node<Page>>, Vec<Url>);
 
 struct Page {
     url: Url,
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `tokio::runtime::Handle::current().metrics().num_workers()`
     // is only available in unstable Tokio.
     // A larger buffer isn't necessary faster.
-    let node_buffer_size = num_cpus::get();
+    let page_buffer_size = num_cpus::get();
 
     // Making more than one request at a time
     // to a host
@@ -113,22 +113,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
         };
 
-    let mut nodes = BinaryHeap::new();
-    let mut node_tasks = Vec::with_capacity(node_buffer_size);
+    let mut pages = BinaryHeap::new();
+    let mut page_tasks = Vec::with_capacity(page_buffer_size);
+
+    let mut wout = std::io::BufWriter::new(std::io::stdout());
+
+    let progress = indicatif::MultiProgress::new();
+    let progress_style = indicatif::ProgressStyle::default_bar()
+        .template("{wide_bar} {pos:>7}/{len:<7} {msg}")
+        .unwrap();
+    let spinner_style = indicatif::ProgressStyle::default_bar()
+        .template("{spinner} {wide_msg}")
+        .unwrap();
+    let pages_progress = progress.add(
+        indicatif::ProgressBar::new(args.urls.len().try_into().unwrap_or(0))
+            .with_style(progress_style.clone())
+            .with_message("Pages   ")
+            .with_finish(indicatif::ProgressFinish::AndLeave),
+    );
+    let requests_progress = progress.add(
+        indicatif::ProgressBar::new(0)
+            .with_style(progress_style)
+            .with_message("Requests")
+            .with_finish(indicatif::ProgressFinish::AndLeave),
+    );
+
+    let mut done_i = std::u16::MAX;
 
     args.urls.into_iter().for_each(|u| match cache.get(&u) {
-        Some(Ok(body)) => nodes.push(Node::new(None, Page { url: u, body })),
-        Some(Err(_)) => {}
-        None => add_url(&mut host_resources, None, u),
+        Some(Ok(body)) => pages.push(Node::new(None, Page { url: u, body })),
+        Some(Err(_)) => pages_progress.inc(1),
+        None => {
+            requests_progress.inc_length(1);
+            add_url(&mut host_resources, None, u);
+        }
     });
-
-    let mut wout = io::BufWriter::new(io::stdout());
-    let mut match_buffer = Vec::new();
-    let mut werr = io::BufWriter::new(io::stderr());
-    let mut print_i = std::u8::MAX;
-
-    let mut done_i = std::u8::MAX;
-
     loop {
         // We want to finish tasks
         // before queuing new requests
@@ -136,43 +155,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // and search deeper nodes.
 
         swap_retain_mut(
-            |x: &mut tokio::task::JoinHandle<_>| match x.now_or_never() {
+            |x: &mut tokio::task::JoinHandle<ParseResult>| match x.now_or_never() {
                 Some(Ok((match_data, children_data))) => {
+                    pages_progress.inc(1);
                     if let Some(s) = match_data {
-                        match_buffer.push(s);
+                        tokio::task::block_in_place(|| {
+                            progress.suspend(|| {
+                                wout.write_all(s.as_bytes())
+                                    .and_then(|_| wout.write_all(b"\n"))
+                                    .and_then(|_| wout.flush())
+                                    .expect("Failed to print match");
+                            })
+                        });
                     };
-                    if let Some((children, (node, urls))) = children_data {
-                        for node in children {
-                            nodes.push(node);
+
+                    if let Some((children, page_errors, (node, urls))) = children_data {
+                        pages_progress.inc_length(
+                            (children.len() + urls.len()).try_into().unwrap_or(0) + page_errors,
+                        );
+                        pages_progress.inc(page_errors);
+                        for page in children {
+                            pages.push(page);
                         }
+                        requests_progress.inc_length(urls.len().try_into().unwrap_or(0));
                         for u in urls {
                             add_url(&mut host_resources, Some(Arc::clone(&node)), u);
                         }
                     };
+
                     false
                 }
                 Some(Err(e)) => panic!("{}", e),
                 None => true,
             },
-            &mut node_tasks,
+            &mut page_tasks,
         );
 
         // Host clients can accumulate over time,
         // but we only need actively used clients.
         host_resources.retain(|_, (urls, task)| {
-            if let Some(Some(node)) = task.try_finish() {
-                nodes.push(node);
+            if let Some(result) = task.try_finish() {
+                requests_progress.inc(1);
+                match result {
+                    Ok(page) => pages.push(page),
+                    Err(_) => pages_progress.inc(1),
+                }
             }
             task.try_start(|mut client| match urls.pop() {
-                Some((p, u)) => Ok(tokio::task::spawn(async move {
-                    (
-                        get_with_cache(cache, &mut client, &u)
-                            .await
-                            .map(|body| Node::new(p, Page { url: u, body }))
-                            .ok(),
-                        client,
-                    )
-                })),
+                Some((p, u)) => {
+                    let spinner = progress.add(
+                        indicatif::ProgressBar::new_spinner()
+                            .with_style(spinner_style.clone())
+                            .with_message(u.to_string()),
+                    );
+                    Ok(tokio::task::spawn(async move {
+                        spinner.enable_steady_tick(Duration::from_millis(100));
+                        (
+                            get_with_cache(cache, &mut client, &u)
+                                .await
+                                .map(|body| Node::new(p, Page { url: u, body })),
+                            client,
+                        )
+                    }))
+                }
                 None => Err(client),
             });
             task.is_working_or(|client| {
@@ -181,92 +226,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         });
 
-        while node_tasks.len() < node_buffer_size {
-            match nodes.pop() {
-                Some(node) => {
-                    node_tasks.push(tokio::task::spawn(async move {
-                        parse_page(cache, args.max_depth, re, exclude_urls_re, node)
+        while page_tasks.len() < page_buffer_size {
+            match pages.pop() {
+                Some(page) => {
+                    page_tasks.push(tokio::task::spawn(async move {
+                        parse_page(cache, args.max_depth, re, exclude_urls_re, page)
                     }));
                 }
                 None => break,
             }
         }
 
-        // We don't need to print progress
-        // as often as we need to coordinate tasks.
-        if print_i > 100 {
-            print_i = 0;
-
-            let _ = werr.write_all(CLEAR_CODE).await;
-
-            if !match_buffer.is_empty() {
-                let _ = werr.flush().await;
-
-                for s in match_buffer.drain(..) {
-                    wout.write_all(s.as_bytes()).await?;
-                    wout.write_all(b"\n").await?;
-                }
-                wout.flush().await?;
+        // Completion only matters once.
+        // We don't need to check often,
+        // and loops will occur faster
+        // without any tasks.
+        if done_i >= 1000 {
+            done_i = 0;
+            if pages.is_empty()
+                && page_tasks.is_empty()
+                && host_resources
+                    .values()
+                    .all(|(urls, task)| urls.is_empty() && task.is_waiting())
+            {
+                return Ok(());
             }
-
-            // Search may spend a long time between matches.
-            // We want to indicate progress,
-            // but we don't want to clutter output.
-            // Overflowing terminal width
-            // may prevent clearing the line.
-            let progress_line = {
-                let (num_urls, num_request_tasks) =
-                    host_resources
-                        .values()
-                        .fold((0, 0), |(x, y), (urls, task)| {
-                            (x + urls.len(), if task.is_waiting() { y } else { y + 1 })
-                        });
-                format!(
-                    "active requests: {:<2}, queued requests: {:<4}, pages searching: {:<2}, pages queued: {}",
-                    num_request_tasks,
-                    num_urls,
-                    node_tasks.len(),
-                    nodes.len()
-                )
-            };
-            let _ = match terminal_size::terminal_size() {
-                Some((terminal_size::Width(w), _)) => {
-                    let s = progress_line.as_bytes();
-                    // Slice is safe
-                    // because the string will never be longer than itself.
-                    werr.write_all(unsafe { s.get_unchecked(..std::cmp::min(s.len(), w.into())) })
-                }
-                None => werr.write_all(progress_line.as_bytes()),
-            }
-            .await;
-            let _ = werr.flush().await;
-
-            // We always want to print
-            // before completion.
-            //
-            // Completion only matters once.
-            // We don't need to check often,
-            // and loops will occur faster
-            // without any tasks.
-            if done_i >= 10 {
-                done_i = 0;
-                if nodes.is_empty()
-                    && node_tasks.is_empty()
-                    && host_resources
-                        .values()
-                        .all(|(urls, task)| urls.is_empty() && task.is_waiting())
-                {
-                    return Ok(());
-                }
-            }
-            done_i += 1;
-        } else {
-            // If we never yield,
-            // tasks may never get time to complete,
-            // and the program may stall.
-            tokio::task::yield_now().await;
         }
-        print_i += 1;
+        done_i += 1;
+
+        // If we never yield,
+        // tasks may never get time to complete,
+        // and the program may stall.
+        tokio::task::yield_now().await;
     }
 }
 
@@ -331,16 +322,13 @@ where
     }
 }
 
-type RequestData = (Arc<Node<Page>>, Vec<Url>);
-
-#[allow(clippy::type_complexity)]
 fn parse_page(
     cache: &Cache<Url, Response>,
     max_depth: u64,
     re: &Regex,
     exclude_urls_re: &Option<Regex>,
     node: Node<Page>,
-) -> (Option<String>, Option<(Vec<Node<Page>>, RequestData)>) {
+) -> ParseResult {
     match &node.value().body {
         Body::Html(body) => {
             match html5ever::parse_document(RcDom::default(), Default::default())
@@ -359,6 +347,7 @@ fn parse_page(
                         let node_ = Arc::new(node);
                         let node_path: HashSet<_> = path_to_root(&node_).map(|x| &x.url).collect();
                         let mut children = Vec::new();
+                        let mut page_errors = 0;
                         let mut urls = Vec::new();
                         links(&node_.value().url, &dom)
                             .into_iter()
@@ -378,10 +367,10 @@ fn parse_page(
                                     Some(Arc::clone(&node_)),
                                     Page { url: u, body },
                                 )),
-                                Some(Err(_)) => {}
+                                Some(Err(_)) => page_errors += 1,
                                 None => urls.push(u),
                             });
-                        Some((children, (node_, urls)))
+                        Some((children, page_errors, (node_, urls)))
                     } else {
                         None
                     };
