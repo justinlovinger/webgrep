@@ -1,14 +1,11 @@
 mod cache;
 mod client;
 mod node;
-mod task;
 
 use crate::cache::Cache;
 use crate::client::{Body, Response, SlowClient};
 use crate::node::{path_to_root, Node};
-use crate::task::TaskWithResource;
 use clap::Parser;
-use futures::future::FutureExt;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use regex::{Regex, RegexBuilder};
@@ -21,6 +18,11 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Host::{Domain, Ipv4, Ipv6};
+
+enum TaskResult<'a> {
+    Page(ParseResult),
+    Request((Result<Node<Page>, client::Error>, (String, SlowClient<'a>))),
+}
 
 type ParseResult = (Option<String>, Option<(Vec<Node<Page>>, u64, RequestData)>);
 type RequestData = (Arc<Node<Page>>, Vec<Url>);
@@ -82,40 +84,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("Failed to initialize cache"),
     ));
 
-    // Tokio uses number of CPU cores as default number of worker threads.
-    // `tokio::runtime::Handle::current().metrics().num_workers()`
-    // is only available in unstable Tokio.
-    // A larger buffer isn't necessary faster.
-    let page_buffer_size = num_cpus::get();
-
-    // Making more than one request at a time
-    // to a host
-    // could result in repercussions,
-    // like IP banning.
-    // Most websites host all subdomains together,
-    // so we to limit requests by domain,
-    // not FQDN.
-    let mut host_resources = HashMap::new();
-    let add_url =
-        |host_resources: &mut HashMap<_, (BinaryHeap<_>, TaskWithResource<_, _>)>, p, u| {
-            let host = small_host_name(&u);
-            match host_resources.get_mut(host) {
-                Some((urls, _)) => urls.push((p, u)),
-                None => {
-                    let host_string = host.to_owned();
-                    let mut urls = BinaryHeap::with_capacity(1);
-                    urls.push((p, u));
-                    host_resources.insert(
-                        host_string,
-                        (urls, TaskWithResource::new(SlowClient::new(master_client))),
-                    );
-                }
-            };
-        };
-
-    let mut pages = BinaryHeap::new();
-    let mut page_tasks = Vec::with_capacity(page_buffer_size);
-
     let mut wout = std::io::BufWriter::new(std::io::stdout());
 
     let progress = indicatif::MultiProgress::new();
@@ -138,127 +106,162 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_finish(indicatif::ProgressFinish::AndLeave),
     );
 
-    let mut done_i = std::u16::MAX;
+    // Tokio uses number of CPU cores as default number of worker threads.
+    // `tokio::runtime::Handle::current().metrics().num_workers()`
+    // is only available in unstable Tokio.
+    // A larger buffer isn't necessary faster.
+    let page_buffer_size = num_cpus::get();
+
+    let mut tasks = tokio::task::JoinSet::new();
+
+    let request_task = |host, mut client, p, u: Url| {
+        let spinner = progress.add(
+            indicatif::ProgressBar::new_spinner()
+                .with_style(spinner_style.clone())
+                .with_message(u.to_string()),
+        );
+        async move {
+            spinner.enable_steady_tick(Duration::from_millis(100));
+            TaskResult::Request((
+                get_with_cache(cache, &mut client, &u)
+                    .await
+                    .map(|body| Node::new(p, Page { url: u, body })),
+                (host, client),
+            ))
+        }
+    };
+
+    // Making more than one request at a time
+    // to a host
+    // could result in repercussions,
+    // like IP banning.
+    // Most websites host all subdomains together,
+    // so we to limit requests by domain,
+    // not FQDN.
+    let mut host_resources = HashMap::new();
+    let add_url = |tasks: &mut tokio::task::JoinSet<_>,
+                   host_resources: &mut HashMap<_, (BinaryHeap<_>, Option<_>)>,
+                   p,
+                   u| {
+        let host = small_host_name(&u);
+        match host_resources.get_mut(host) {
+            Some((urls, client)) => match client.take() {
+                Some(c) => tasks.spawn(request_task(host.to_owned(), c, p, u)),
+                None => urls.push((p, u)),
+            },
+            None => {
+                let host_ = host.to_owned();
+                tasks.spawn(request_task(
+                    host_.clone(),
+                    SlowClient::new(master_client),
+                    p,
+                    u,
+                ));
+                host_resources.insert(host_, (BinaryHeap::new(), None));
+            }
+        };
+    };
+
+    let mut pages = BinaryHeap::new();
+    let mut num_page_tasks = 0;
+
+    let page_task = |page| async move {
+        TaskResult::Page(parse_page(cache, args.max_depth, re, exclude_urls_re, page))
+    };
 
     args.urls.into_iter().for_each(|u| match cache.get(&u) {
-        Some(Ok(body)) => pages.push(Node::new(None, Page { url: u, body })),
+        Some(Ok(body)) => {
+            let page = Node::new(None, Page { url: u, body });
+            if num_page_tasks < page_buffer_size {
+                num_page_tasks += 1;
+                tasks.spawn(page_task(page))
+            } else {
+                pages.push(page)
+            }
+        }
         Some(Err(_)) => pages_progress.inc(1),
         None => {
             requests_progress.inc_length(1);
-            add_url(&mut host_resources, None, u);
+            add_url(&mut tasks, &mut host_resources, None, u);
         }
     });
-    loop {
-        // We want to finish tasks
-        // before queuing new requests
-        // to maximize throughput
-        // and search deeper nodes.
+    while let Some(res) = tasks.join_one().await.unwrap() {
+        match res {
+            TaskResult::Page((match_data, children_data)) => {
+                num_page_tasks -= 1;
+                pages_progress.inc(1);
+                if let Some(s) = match_data {
+                    tokio::task::block_in_place(|| {
+                        progress.suspend(|| {
+                            wout.write_all(s.as_bytes())
+                                .and_then(|_| wout.write_all(b"\n"))
+                                .and_then(|_| wout.flush())
+                                .expect("Failed to print match");
+                        })
+                    });
+                };
 
-        swap_retain_mut(
-            |x: &mut tokio::task::JoinHandle<ParseResult>| match x.now_or_never() {
-                Some(Ok((match_data, children_data))) => {
-                    pages_progress.inc(1);
-                    if let Some(s) = match_data {
-                        tokio::task::block_in_place(|| {
-                            progress.suspend(|| {
-                                wout.write_all(s.as_bytes())
-                                    .and_then(|_| wout.write_all(b"\n"))
-                                    .and_then(|_| wout.flush())
-                                    .expect("Failed to print match");
-                            })
-                        });
-                    };
+                if let Some((children, page_errors, (node, urls))) = children_data {
+                    pages_progress.inc_length(
+                        (children.len() + urls.len()).try_into().unwrap_or(0) + page_errors,
+                    );
+                    pages_progress.inc(page_errors);
+                    for page in children {
+                        pages.push(page);
+                        // add_page(&mut tasks, &mut num_page_tasks, page);
+                    }
+                    requests_progress.inc_length(urls.len().try_into().unwrap_or(0));
+                    for u in urls {
+                        // TODO: add all URLs
+                        // before starting request tasks,
+                        // in case we have more than one URL
+                        // for the same host.
+                        add_url(&mut tasks, &mut host_resources, Some(Arc::clone(&node)), u);
+                    }
+                };
 
-                    if let Some((children, page_errors, (node, urls))) = children_data {
-                        pages_progress.inc_length(
-                            (children.len() + urls.len()).try_into().unwrap_or(0) + page_errors,
-                        );
-                        pages_progress.inc(page_errors);
-                        for page in children {
-                            pages.push(page);
+                // We want to add as many pages as possible
+                // before picking the best pages
+                // to start as tasks.
+                while num_page_tasks < page_buffer_size {
+                    match pages.pop() {
+                        Some(page) => {
+                            num_page_tasks += 1;
+                            tasks.spawn(page_task(page));
                         }
-                        requests_progress.inc_length(urls.len().try_into().unwrap_or(0));
-                        for u in urls {
-                            add_url(&mut host_resources, Some(Arc::clone(&node)), u);
-                        }
-                    };
-
-                    false
+                        None => break,
+                    }
                 }
-                Some(Err(e)) => panic!("{}", e),
-                None => true,
-            },
-            &mut page_tasks,
-        );
-
-        // Host clients can accumulate over time,
-        // but we only need actively used clients.
-        host_resources.retain(|_, (urls, task)| {
-            if let Some(result) = task.try_finish() {
+            }
+            TaskResult::Request((response, (host, client))) => {
                 requests_progress.inc(1);
-                match result {
-                    Ok(page) => pages.push(page),
+                match response {
+                    Ok(page) => {
+                        if num_page_tasks < page_buffer_size {
+                            num_page_tasks += 1;
+                            tasks.spawn(page_task(page))
+                        } else {
+                            pages.push(page)
+                        }
+                    }
                     Err(_) => pages_progress.inc(1),
                 }
-            }
-            task.try_start(|mut client| match urls.pop() {
-                Some((p, u)) => {
-                    let spinner = progress.add(
-                        indicatif::ProgressBar::new_spinner()
-                            .with_style(spinner_style.clone())
-                            .with_message(u.to_string()),
-                    );
-                    Ok(tokio::task::spawn(async move {
-                        spinner.enable_steady_tick(Duration::from_millis(100));
-                        (
-                            get_with_cache(cache, &mut client, &u)
-                                .await
-                                .map(|body| Node::new(p, Page { url: u, body })),
-                            client,
-                        )
-                    }))
-                }
-                None => Err(client),
-            });
-            task.is_working_or(|client| {
-                debug_assert!(urls.is_empty());
-                client.time_remaining() > Duration::ZERO
-            })
-        });
 
-        while page_tasks.len() < page_buffer_size {
-            match pages.pop() {
-                Some(page) => {
-                    page_tasks.push(tokio::task::spawn(async move {
-                        parse_page(cache, args.max_depth, re, exclude_urls_re, page)
-                    }));
+                match host_resources.get_mut(&host) {
+                    Some((urls, holding_space)) => match urls.pop() {
+                        Some((p, u)) => tasks.spawn(request_task(host, client, p, u)),
+                        None => {
+                            debug_assert!(holding_space.is_none());
+                            _ = holding_space.insert(client);
+                        }
+                    },
+                    None => panic!("Host resource invariant failed"),
                 }
-                None => break,
             }
         }
-
-        // Completion only matters once.
-        // We don't need to check often,
-        // and loops will occur faster
-        // without any tasks.
-        if done_i >= 1000 {
-            done_i = 0;
-            if pages.is_empty()
-                && page_tasks.is_empty()
-                && host_resources
-                    .values()
-                    .all(|(urls, task)| urls.is_empty() && task.is_waiting())
-            {
-                return Ok(());
-            }
-        }
-        done_i += 1;
-
-        // If we never yield,
-        // tasks may never get time to complete,
-        // and the program may stall.
-        tokio::task::yield_now().await;
     }
+
+    Ok(())
 }
 
 fn small_host_name(u: &Url) -> &str {
@@ -305,21 +308,6 @@ async fn get_and_cache_from_web<'a>(
     let _ = cache.set(u, &body);
 
     body
-}
-
-// Like experimental `drain_filter`:
-fn swap_retain_mut<F, T>(mut f: F, xs: &mut Vec<T>)
-where
-    F: FnMut(&mut T) -> bool,
-{
-    let mut i = 0;
-    while i < xs.len() {
-        if f(&mut xs[i]) {
-            i += 1;
-        } else {
-            xs.swap_remove(i);
-        };
-    }
 }
 
 fn parse_page(
