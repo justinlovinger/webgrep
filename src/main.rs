@@ -3,33 +3,22 @@ mod client;
 mod node;
 
 use crate::cache::Cache;
-use crate::client::{Body, Response, SlowClient};
-use crate::node::{path_to_root, Node};
+use crate::client::{Response, SlowClient};
+use crate::node::Node;
+use crate::page::{parse_page, Page, ParseData};
 use clap::Parser;
-use html5ever::tendril::TendrilSink;
-use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use regex::{Regex, RegexBuilder};
 use reqwest::Url;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::default::Default;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Host::{Domain, Ipv4, Ipv6};
 
 enum TaskResult<'a> {
-    Page(ParseResult),
+    Page(ParseData),
     Request((Result<Node<Page>, client::Error>, (String, SlowClient<'a>))),
-}
-
-type ParseResult = (Option<String>, Option<(Vec<Node<Page>>, u64, RequestData)>);
-type RequestData = (Arc<Node<Page>>, Vec<Url>);
-
-struct Page {
-    url: Url,
-    body: Body,
 }
 
 #[derive(Parser)]
@@ -125,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             TaskResult::Request((
                 get_with_cache(cache, &mut client, &u)
                     .await
-                    .map(|body| Node::new(p, Page { url: u, body })),
+                    .map(|body| Node::new(p, Page::new(u, body))),
                 (host, client),
             ))
         }
@@ -171,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     args.urls.into_iter().for_each(|u| match cache.get(&u) {
         Some(Ok(body)) => {
-            let page = Node::new(None, Page { url: u, body });
+            let page = Node::new(None, Page::new(u, body));
             if num_page_tasks < page_buffer_size {
                 num_page_tasks += 1;
                 tasks.spawn(page_task(page))
@@ -310,145 +299,173 @@ async fn get_and_cache_from_web<'a>(
     body
 }
 
-fn parse_page(
-    cache: &Cache<Url, Response>,
-    max_depth: u64,
-    re: &Regex,
-    exclude_urls_re: &Option<Regex>,
-    node: Node<Page>,
-) -> ParseResult {
-    match &node.value().body {
-        Body::Html(body) => {
-            match html5ever::parse_document(RcDom::default(), Default::default())
-                .from_utf8()
-                .read_from(&mut body.as_bytes())
-                .ok()
-            {
-                Some(dom) => {
-                    // Matches may span DOM nodes,
-                    // so we can't just check DOM nodes individually.
-                    let match_data = re
-                        .is_match(&inner_text(&dom))
-                        .then(|| display_node_path(&node));
+mod page {
+    use crate::cache::Cache;
+    use crate::client::{Body, Response};
+    use crate::node::{path_to_root, Node};
+    use html5ever::tendril::TendrilSink;
+    use markup5ever_rcdom::{Handle, NodeData, RcDom};
+    use regex::Regex;
+    use reqwest::Url;
+    use std::collections::HashSet;
+    use std::default::Default;
+    use std::sync::Arc;
 
-                    let children_data = if node.depth() < max_depth {
-                        let node_ = Arc::new(node);
-                        let node_path: HashSet<_> = path_to_root(&node_).map(|x| &x.url).collect();
-                        let mut children = Vec::new();
-                        let mut page_errors = 0;
-                        let mut urls = Vec::new();
-                        links(&node_.value().url, &dom)
-                            .into_iter()
-                            // We don't need to know if a path cycles back on itself.
-                            // For us,
-                            // path cycles waste time and lead to infinite loops.
-                            .filter(|u| !node_path.contains(&u))
-                            // We're hoping the Rust compiler optimizes this branch
-                            // out of the loop.
-                            .filter(|u| {
-                                exclude_urls_re
-                                    .as_ref()
-                                    .map_or(true, |re| !re.is_match(u.as_str()))
-                            })
-                            .for_each(|u| match cache.get(&u) {
-                                Some(Ok(body)) => children.push(Node::new(
-                                    Some(Arc::clone(&node_)),
-                                    Page { url: u, body },
-                                )),
-                                Some(Err(_)) => page_errors += 1,
-                                None => urls.push(u),
-                            });
-                        Some((children, page_errors, (node_, urls)))
-                    } else {
-                        None
-                    };
+    pub type ParseData = (Option<String>, Option<(Vec<Node<Page>>, u64, RequestData)>);
+    pub type RequestData = (Arc<Node<Page>>, Vec<Url>);
 
-                    (match_data, children_data)
-                }
-                None => (None, None),
-            }
-        }
-        // TODO: decompress PDF if necessary.
-        Body::Pdf(raw) => (re.is_match(raw).then(|| display_node_path(&node)), None),
-        Body::Plain(text) => (re.is_match(text).then(|| display_node_path(&node)), None),
+    pub struct Page {
+        url: Url,
+        body: Body,
     }
-}
 
-fn display_node_path(node: &Node<Page>) -> String {
-    // `map(...).intersperse(" > ")` would be better,
-    // but it is only available in nightly builds,
-    // as of 2022-04-18.
-    node.path_from_root()
-        .iter()
-        .map(|x| x.url.as_str())
-        .collect::<Vec<_>>()
-        .join(" > ")
-}
+    impl Page {
+        pub fn new(url: Url, body: Body) -> Self {
+            Self { url, body }
+        }
+    }
 
-fn inner_text(dom: &RcDom) -> String {
-    let mut s = String::new();
-    walk_dom(
-        &mut |data| {
-            match data {
-                NodeData::Text { contents } => {
-                    s.push_str(contents.borrow().as_ref());
+    pub fn parse_page(
+        cache: &Cache<Url, Response>,
+        max_depth: u64,
+        re: &Regex,
+        exclude_urls_re: &Option<Regex>,
+        node: Node<Page>,
+    ) -> ParseData {
+        match &node.value().body {
+            Body::Html(body) => {
+                match html5ever::parse_document(RcDom::default(), Default::default())
+                    .from_utf8()
+                    .read_from(&mut body.as_bytes())
+                    .ok()
+                {
+                    Some(dom) => {
+                        // Matches may span DOM nodes,
+                        // so we can't just check DOM nodes individually.
+                        let match_data = re
+                            .is_match(&inner_text(&dom))
+                            .then(|| display_node_path(&node));
+
+                        let children_data = if node.depth() < max_depth {
+                            let node_ = Arc::new(node);
+                            let node_path: HashSet<_> =
+                                path_to_root(&node_).map(|x| &x.url).collect();
+                            let mut children = Vec::new();
+                            let mut page_errors = 0;
+                            let mut urls = Vec::new();
+                            links(&node_.value().url, &dom)
+                                .into_iter()
+                                // We don't need to know if a path cycles back on itself.
+                                // For us,
+                                // path cycles waste time and lead to infinite loops.
+                                .filter(|u| !node_path.contains(&u))
+                                // We're hoping the Rust compiler optimizes this branch
+                                // out of the loop.
+                                .filter(|u| {
+                                    exclude_urls_re
+                                        .as_ref()
+                                        .map_or(true, |re| !re.is_match(u.as_str()))
+                                })
+                                .for_each(|u| match cache.get(&u) {
+                                    Some(Ok(body)) => children.push(Node::new(
+                                        Some(Arc::clone(&node_)),
+                                        Page::new(u, body),
+                                    )),
+                                    Some(Err(_)) => page_errors += 1,
+                                    None => urls.push(u),
+                                });
+                            Some((children, page_errors, (node_, urls)))
+                        } else {
+                            None
+                        };
+
+                        (match_data, children_data)
+                    }
+                    None => (None, None),
                 }
-                NodeData::Element { name, .. } => {
-                    // We want to search like a person viewing the page,
-                    // so we ignore invisible tags.
-                    if ["head", "script"].contains(&name.local.as_ref()) {
-                        return false;
+            }
+            // TODO: decompress PDF if necessary.
+            Body::Pdf(raw) => (re.is_match(raw).then(|| display_node_path(&node)), None),
+            Body::Plain(text) => (re.is_match(text).then(|| display_node_path(&node)), None),
+        }
+    }
+
+    fn display_node_path(node: &Node<Page>) -> String {
+        // `map(...).intersperse(" > ")` would be better,
+        // but it is only available in nightly builds,
+        // as of 2022-04-18.
+        node.path_from_root()
+            .iter()
+            .map(|x| x.url.as_str())
+            .collect::<Vec<_>>()
+            .join(" > ")
+    }
+
+    fn inner_text(dom: &RcDom) -> String {
+        let mut s = String::new();
+        walk_dom(
+            &mut |data| {
+                match data {
+                    NodeData::Text { contents } => {
+                        s.push_str(contents.borrow().as_ref());
+                    }
+                    NodeData::Element { name, .. } => {
+                        // We want to search like a person viewing the page,
+                        // so we ignore invisible tags.
+                        if ["head", "script"].contains(&name.local.as_ref()) {
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+                true
+            },
+            &dom.document,
+        );
+        s
+    }
+
+    // We only want unique links.
+    // `HashSet` takes care of this.
+    fn links(origin: &Url, dom: &RcDom) -> HashSet<Url> {
+        let mut xs = HashSet::new();
+        walk_dom(
+            &mut |data| {
+                if let NodeData::Element { name, attrs, .. } = data {
+                    if name.local.as_ref() == "a" {
+                        attrs
+                            .borrow()
+                            .iter()
+                            .filter(|x| x.name.local.as_ref() == "href")
+                            .take(1) // An `a` tag shouldn't have more than one `href`
+                            .filter_map(|x| origin.join(&x.value).ok())
+                            .for_each(|x| {
+                                xs.insert(x);
+                            });
                     }
                 }
-                _ => {}
-            }
-            true
-        },
-        &dom.document,
-    );
-    s
-}
+                true
+            },
+            &dom.document,
+        );
+        xs
+    }
 
-// We only want unique links.
-// `HashSet` takes care of this.
-fn links(origin: &Url, dom: &RcDom) -> HashSet<Url> {
-    let mut xs = HashSet::new();
-    walk_dom(
-        &mut |data| {
-            if let NodeData::Element { name, attrs, .. } = data {
-                if name.local.as_ref() == "a" {
-                    attrs
-                        .borrow()
-                        .iter()
-                        .filter(|x| x.name.local.as_ref() == "href")
-                        .take(1) // An `a` tag shouldn't have more than one `href`
-                        .filter_map(|x| origin.join(&x.value).ok())
-                        .for_each(|x| {
-                            xs.insert(x);
-                        });
-                }
+    fn walk_dom<F>(f: &mut F, handle: &Handle)
+    where
+        F: FnMut(&NodeData) -> bool,
+    {
+        if f(&handle.data) {
+            if let NodeData::Element {
+                template_contents: Some(inner),
+                ..
+            } = &handle.data
+            {
+                walk_dom(f, inner);
             }
-            true
-        },
-        &dom.document,
-    );
-    xs
-}
-
-fn walk_dom<F>(f: &mut F, handle: &Handle)
-where
-    F: FnMut(&NodeData) -> bool,
-{
-    if f(&handle.data) {
-        if let NodeData::Element {
-            template_contents: Some(inner),
-            ..
-        } = &handle.data
-        {
-            walk_dom(f, inner);
-        }
-        for child in handle.children.borrow().iter() {
-            walk_dom(f, child);
+            for child in handle.children.borrow().iter() {
+                walk_dom(f, child);
+            }
         }
     }
 }
