@@ -5,7 +5,7 @@ mod node;
 use crate::cache::Cache;
 use crate::client::{Response, SlowClient};
 use crate::node::Node;
-use crate::page::{parse_page, Page, ParseData};
+use crate::page::{Page, RunTicket};
 use clap::Parser;
 use regex::{Regex, RegexBuilder};
 use reqwest::Url;
@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Host::{Domain, Ipv4, Ipv6};
 
-enum TaskResult<'a> {
-    Page(ParseData),
+pub enum TaskResult<'a> {
+    Page(RunTicket),
     Request((Result<Node<Page>, client::Error>, (String, SlowClient<'a>))),
 }
 
@@ -49,15 +49,6 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let re: &'static _ = Box::leak(Box::new(
-        RegexBuilder::new(args.pattern_re.as_str())
-            .case_insensitive(args.ignore_case)
-            .build()
-            .unwrap(),
-    ));
-
-    let exclude_urls_re: &'static _ = Box::leak(Box::new(args.exclude_urls_re));
-
     let master_client: &'static _ = Box::leak(Box::new(
         reqwest::Client::builder()
             // `timeout` doesn't work without `connect_timeout`.
@@ -72,6 +63,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .expect("Failed to initialize cache"),
     ));
+
+    let mut tasks = tokio::task::JoinSet::new();
+
+    let mut page_runner = crate::page::Runner::new(
+        cache,
+        args.max_depth,
+        RegexBuilder::new(args.pattern_re.as_str())
+            .case_insensitive(args.ignore_case)
+            .build()
+            .unwrap(),
+        args.exclude_urls_re,
+        // Tokio uses number of CPU cores as default number of worker threads.
+        // `tokio::runtime::Handle::current().metrics().num_workers()`
+        // is only available in unstable Tokio.
+        // A larger buffer isn't necessary faster.
+        num_cpus::get(),
+    );
 
     let mut wout = std::io::BufWriter::new(std::io::stdout());
 
@@ -94,14 +102,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_message("Requests")
             .with_finish(indicatif::ProgressFinish::AndLeave),
     );
-
-    // Tokio uses number of CPU cores as default number of worker threads.
-    // `tokio::runtime::Handle::current().metrics().num_workers()`
-    // is only available in unstable Tokio.
-    // A larger buffer isn't necessary faster.
-    let page_buffer_size = num_cpus::get();
-
-    let mut tasks = tokio::task::JoinSet::new();
 
     let request_task = |host, mut client, p, u: Url| {
         let spinner = progress.add(
@@ -151,23 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
     };
 
-    let mut pages = BinaryHeap::new();
-    let mut num_page_tasks = 0;
-
-    let page_task = |page| async move {
-        TaskResult::Page(parse_page(cache, args.max_depth, re, exclude_urls_re, page))
-    };
-
     args.urls.into_iter().for_each(|u| match cache.get(&u) {
-        Some(Ok(body)) => {
-            let page = Node::new(None, Page::new(u, body));
-            if num_page_tasks < page_buffer_size {
-                num_page_tasks += 1;
-                tasks.spawn(page_task(page))
-            } else {
-                pages.push(page)
-            }
-        }
+        Some(Ok(body)) => page_runner.push(&mut tasks, Node::new(None, Page::new(u, body))),
         Some(Err(_)) => pages_progress.inc(1),
         None => {
             requests_progress.inc_length(1);
@@ -176,9 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     while let Some(res) = tasks.join_one().await.unwrap() {
         match res {
-            TaskResult::Page((match_data, children_data)) => {
-                num_page_tasks -= 1;
+            TaskResult::Page(ticket) => {
                 pages_progress.inc(1);
+                let (match_data, children_data) = page_runner.redeem(&mut tasks, ticket);
+
                 if let Some(s) = match_data {
                     tokio::task::block_in_place(|| {
                         progress.suspend(|| {
@@ -190,15 +176,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 };
 
-                if let Some((children, page_errors, (node, urls))) = children_data {
+                if let Some((good_cache_hits, bad_cache_hits, (node, urls))) = children_data {
                     pages_progress.inc_length(
-                        (children.len() + urls.len()).try_into().unwrap_or(0) + page_errors,
+                        (good_cache_hits + urls.len()).try_into().unwrap_or(0) + bad_cache_hits,
                     );
-                    pages_progress.inc(page_errors);
-                    for page in children {
-                        pages.push(page);
-                        // add_page(&mut tasks, &mut num_page_tasks, page);
-                    }
+                    pages_progress.inc(bad_cache_hits);
                     requests_progress.inc_length(urls.len().try_into().unwrap_or(0));
                     for u in urls {
                         // TODO: add all URLs
@@ -208,31 +190,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         add_url(&mut tasks, &mut host_resources, Some(Arc::clone(&node)), u);
                     }
                 };
-
-                // We want to add as many pages as possible
-                // before picking the best pages
-                // to start as tasks.
-                while num_page_tasks < page_buffer_size {
-                    match pages.pop() {
-                        Some(page) => {
-                            num_page_tasks += 1;
-                            tasks.spawn(page_task(page));
-                        }
-                        None => break,
-                    }
-                }
             }
             TaskResult::Request((response, (host, client))) => {
                 requests_progress.inc(1);
                 match response {
-                    Ok(page) => {
-                        if num_page_tasks < page_buffer_size {
-                            num_page_tasks += 1;
-                            tasks.spawn(page_task(page))
-                        } else {
-                            pages.push(page)
-                        }
-                    }
+                    Ok(page) => page_runner.push(&mut tasks, page),
                     Err(_) => pages_progress.inc(1),
                 }
 
@@ -303,15 +265,134 @@ mod page {
     use crate::cache::Cache;
     use crate::client::{Body, Response};
     use crate::node::{path_to_root, Node};
+    use crate::TaskResult;
     use html5ever::tendril::TendrilSink;
     use markup5ever_rcdom::{Handle, NodeData, RcDom};
     use regex::Regex;
     use reqwest::Url;
+    use std::collections::BinaryHeap;
     use std::collections::HashSet;
     use std::default::Default;
     use std::sync::Arc;
+    use tokio::task::JoinSet;
 
-    pub type ParseData = (Option<String>, Option<(Vec<Node<Page>>, u64, RequestData)>);
+    pub struct Runner {
+        cache: &'static Cache<Url, Result<Body, crate::client::Error>>,
+        max_depth: u64,
+        re: &'static Regex,
+        exclude_urls_re: &'static Option<Regex>,
+        max_tasks: usize,
+        num_tasks: usize,
+        queue: BinaryHeap<Node<Page>>,
+    }
+
+    impl Runner {
+        pub fn new(
+            cache: &'static Cache<Url, Result<Body, crate::client::Error>>,
+            max_depth: u64,
+            re: Regex,
+            exclude_urls_re: Option<Regex>,
+            max_tasks: usize,
+        ) -> Self {
+            Self {
+                cache,
+                max_depth,
+                re: Box::leak(Box::new(re)),
+                exclude_urls_re: Box::leak(Box::new(exclude_urls_re)),
+                max_tasks,
+                num_tasks: 0,
+                queue: BinaryHeap::new(),
+            }
+        }
+
+        pub fn redeem(
+            &mut self,
+            join_set: &mut JoinSet<TaskResult<'static>>,
+            x: RunTicket,
+        ) -> RunOutput {
+            self.num_tasks -= 1;
+            (
+                x.0,
+                match x.1 {
+                    Some((pages, bad_cache_hits, request_data)) => {
+                        let good_cache_hits = pages.len();
+                        self.extend(join_set, pages);
+                        Some((good_cache_hits, bad_cache_hits, request_data))
+                    }
+                    None => {
+                        if let Some(page) = self.queue.pop() {
+                            self.spawn(join_set, page);
+                        }
+                        None
+                    }
+                },
+            )
+        }
+
+        fn extend(&mut self, join_set: &mut JoinSet<TaskResult<'static>>, pages: Vec<Node<Page>>) {
+            // We want to add as many pages as possible
+            // before picking the best pages
+            // to start as tasks,
+            // but we don't want to unnecessarily add pages to the queue.
+            let n = self.max_tasks - self.num_tasks;
+            if self.queue.is_empty() && n >= pages.len() {
+                for page in pages {
+                    self.spawn(join_set, page);
+                }
+            } else if n >= pages.len() + self.queue.len() {
+                for page in pages {
+                    self.spawn(join_set, page);
+                }
+                while let Some(page) = self.queue.pop() {
+                    self.spawn(join_set, page);
+                }
+                debug_assert!(self.queue.is_empty());
+            } else {
+                self.queue.extend(pages.into_iter());
+                for _ in 0..n {
+                    match self.queue.pop() {
+                        Some(page) => self.spawn(join_set, page),
+                        None => break,
+                    }
+                }
+                debug_assert_eq!(self.num_tasks, self.max_tasks);
+                debug_assert!(!self.queue.is_empty());
+            }
+        }
+
+        pub fn push(&mut self, join_set: &mut JoinSet<TaskResult<'static>>, page: Node<Page>) {
+            if self.num_tasks < self.max_tasks {
+                debug_assert!(self.queue.is_empty());
+                self.spawn(join_set, page)
+            } else {
+                self.queue.push(page)
+            }
+        }
+
+        fn spawn(&mut self, join_set: &mut JoinSet<TaskResult<'static>>, page: Node<Page>) {
+            self.num_tasks += 1;
+            let cache = self.cache;
+            let max_depth = self.max_depth;
+            let re = self.re;
+            let exclude_urls_re = self.exclude_urls_re;
+            join_set.spawn(async move {
+                crate::TaskResult::Page(parse_page(cache, max_depth, re, exclude_urls_re, page))
+            })
+        }
+    }
+
+    pub struct RunTicket(
+        MatchData,
+        Option<(Vec<Node<Page>>, BadCacheHits, RequestData)>,
+    );
+
+    pub type RunOutput = (
+        MatchData,
+        Option<(GoodCacheHits, BadCacheHits, RequestData)>,
+    );
+    pub type MatchData = Option<String>;
+    pub type GoodCacheHits = usize;
+    pub type BadCacheHits = u64;
     pub type RequestData = (Arc<Node<Page>>, Vec<Url>);
 
     pub struct Page {
@@ -325,13 +406,13 @@ mod page {
         }
     }
 
-    pub fn parse_page(
+    fn parse_page(
         cache: &Cache<Url, Response>,
         max_depth: u64,
         re: &Regex,
         exclude_urls_re: &Option<Regex>,
         node: Node<Page>,
-    ) -> ParseData {
+    ) -> RunTicket {
         match &node.value().body {
             Body::Html(body) => {
                 match html5ever::parse_document(RcDom::default(), Default::default())
@@ -379,14 +460,16 @@ mod page {
                             None
                         };
 
-                        (match_data, children_data)
+                        RunTicket(match_data, children_data)
                     }
-                    None => (None, None),
+                    None => RunTicket(None, None),
                 }
             }
             // TODO: decompress PDF if necessary.
-            Body::Pdf(raw) => (re.is_match(raw).then(|| display_node_path(&node)), None),
-            Body::Plain(text) => (re.is_match(text).then(|| display_node_path(&node)), None),
+            Body::Pdf(raw) => RunTicket(re.is_match(raw).then(|| display_node_path(&node)), None),
+            Body::Plain(text) => {
+                RunTicket(re.is_match(text).then(|| display_node_path(&node)), None)
+            }
         }
     }
 
