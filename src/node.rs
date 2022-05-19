@@ -1,9 +1,11 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+pub type NodeParent<T> = Option<Arc<Node<T>>>;
+
 pub struct Node<T> {
     depth: u64,
-    parent: Option<Arc<Node<T>>>,
+    parent: NodeParent<T>,
     value: T,
 }
 

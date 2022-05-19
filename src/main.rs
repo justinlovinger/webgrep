@@ -3,22 +3,16 @@ mod client;
 mod node;
 
 use crate::cache::Cache;
-use crate::client::{Response, SlowClient};
 use crate::node::Node;
-use crate::page::{Page, RunTicket};
+use crate::page::Page;
 use clap::Parser;
 use regex::{Regex, RegexBuilder};
 use reqwest::Url;
-use std::collections::BinaryHeap;
-use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
-use std::time::Duration;
-use url::Host::{Domain, Ipv4, Ipv6};
 
-pub enum TaskResult<'a> {
-    Page(RunTicket),
-    Request((Result<Node<Page>, client::Error>, (String, SlowClient<'a>))),
+pub enum TaskResult {
+    Page(crate::page::RunTicket),
+    Request(crate::request::RunTicket),
 }
 
 #[derive(Parser)]
@@ -49,22 +43,32 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let master_client: &'static _ = Box::leak(Box::new(
-        reqwest::Client::builder()
-            // `timeout` doesn't work without `connect_timeout`.
-            .connect_timeout(core::time::Duration::from_secs(60))
-            .timeout(core::time::Duration::from_secs(60))
-            .build()
-            .expect("Failed to initialize web client"),
-    ));
+    let mut wout = std::io::BufWriter::new(std::io::stdout());
+
+    let progress = indicatif::MultiProgress::new();
+    let progress_style = indicatif::ProgressStyle::default_bar()
+        .template("{wide_bar} {pos:>7}/{len:<7} {msg}")
+        .unwrap();
+    let pages_progress = progress.add(
+        indicatif::ProgressBar::new(args.urls.len().try_into().unwrap_or(0))
+            .with_style(progress_style.clone())
+            .with_message("Pages   ")
+            .with_finish(indicatif::ProgressFinish::AndLeave),
+    );
+    let requests_progress = progress.add(
+        indicatif::ProgressBar::new(0)
+            .with_style(progress_style)
+            .with_message("Requests")
+            .with_finish(indicatif::ProgressFinish::AndLeave),
+    );
+
+    let mut tasks = tokio::task::JoinSet::new();
 
     let cache: &'static _ = Box::leak(Box::new(
         Cache::new("page-cache")
             .await
             .expect("Failed to initialize cache"),
     ));
-
-    let mut tasks = tokio::task::JoinSet::new();
 
     let mut page_runner = crate::page::Runner::new(
         cache,
@@ -81,82 +85,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         num_cpus::get(),
     );
 
-    let mut wout = std::io::BufWriter::new(std::io::stdout());
-
-    let progress = indicatif::MultiProgress::new();
-    let progress_style = indicatif::ProgressStyle::default_bar()
-        .template("{wide_bar} {pos:>7}/{len:<7} {msg}")
-        .unwrap();
-    let spinner_style = indicatif::ProgressStyle::default_bar()
-        .template("{spinner} {wide_msg}")
-        .unwrap();
-    let pages_progress = progress.add(
-        indicatif::ProgressBar::new(args.urls.len().try_into().unwrap_or(0))
-            .with_style(progress_style.clone())
-            .with_message("Pages   ")
-            .with_finish(indicatif::ProgressFinish::AndLeave),
-    );
-    let requests_progress = progress.add(
-        indicatif::ProgressBar::new(0)
-            .with_style(progress_style)
-            .with_message("Requests")
-            .with_finish(indicatif::ProgressFinish::AndLeave),
-    );
-
-    let request_task = |host, mut client, p, u: Url| {
-        let spinner = progress.add(
-            indicatif::ProgressBar::new_spinner()
-                .with_style(spinner_style.clone())
-                .with_message(u.to_string()),
-        );
-        async move {
-            spinner.enable_steady_tick(Duration::from_millis(100));
-            TaskResult::Request((
-                get_with_cache(cache, &mut client, &u)
-                    .await
-                    .map(|body| Node::new(p, Page::new(u, body))),
-                (host, client),
-            ))
-        }
-    };
-
-    // Making more than one request at a time
-    // to a host
-    // could result in repercussions,
-    // like IP banning.
-    // Most websites host all subdomains together,
-    // so we to limit requests by domain,
-    // not FQDN.
-    let mut host_resources = HashMap::new();
-    let add_url = |tasks: &mut tokio::task::JoinSet<_>,
-                   host_resources: &mut HashMap<_, (BinaryHeap<_>, Option<_>)>,
-                   p,
-                   u| {
-        let host = small_host_name(&u);
-        match host_resources.get_mut(host) {
-            Some((urls, client)) => match client.take() {
-                Some(c) => tasks.spawn(request_task(host.to_owned(), c, p, u)),
-                None => urls.push((p, u)),
-            },
-            None => {
-                let host_ = host.to_owned();
-                tasks.spawn(request_task(
-                    host_.clone(),
-                    SlowClient::new(master_client),
-                    p,
-                    u,
-                ));
-                host_resources.insert(host_, (BinaryHeap::new(), None));
-            }
-        };
-    };
+    let mut request_runner = crate::request::Runner::new(cache, &progress);
 
     args.urls.into_iter().for_each(|u| match cache.get(&u) {
         Some(Ok(body)) => page_runner.push(&mut tasks, Node::new(None, Page::new(u, body))),
         Some(Err(_)) => pages_progress.inc(1),
         None => {
             requests_progress.inc_length(1);
-            add_url(&mut tasks, &mut host_resources, None, u);
+            request_runner.push(&mut tasks, None, u);
         }
     });
     while let Some(res) = tasks.join_one().await.unwrap() {
@@ -176,37 +112,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 };
 
-                if let Some((good_cache_hits, bad_cache_hits, (node, urls))) = children_data {
+                if let Some((good_cache_hits, bad_cache_hits, (parent, urls))) = children_data {
                     pages_progress.inc_length(
                         (good_cache_hits + urls.len()).try_into().unwrap_or(0) + bad_cache_hits,
                     );
                     pages_progress.inc(bad_cache_hits);
                     requests_progress.inc_length(urls.len().try_into().unwrap_or(0));
-                    for u in urls {
-                        // TODO: add all URLs
-                        // before starting request tasks,
-                        // in case we have more than one URL
-                        // for the same host.
-                        add_url(&mut tasks, &mut host_resources, Some(Arc::clone(&node)), u);
-                    }
+                    request_runner.extend(&mut tasks, &parent, urls);
                 };
             }
-            TaskResult::Request((response, (host, client))) => {
+            TaskResult::Request(ticket) => {
                 requests_progress.inc(1);
-                match response {
+                match request_runner.redeem(&mut tasks, ticket) {
                     Ok(page) => page_runner.push(&mut tasks, page),
                     Err(_) => pages_progress.inc(1),
-                }
-
-                match host_resources.get_mut(&host) {
-                    Some((urls, holding_space)) => match urls.pop() {
-                        Some((p, u)) => tasks.spawn(request_task(host, client, p, u)),
-                        None => {
-                            debug_assert!(holding_space.is_none());
-                            _ = holding_space.insert(client);
-                        }
-                    },
-                    None => panic!("Host resource invariant failed"),
                 }
             }
         }
@@ -215,50 +134,198 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn small_host_name(u: &Url) -> &str {
-    match u.host() {
-        Some(Domain(x)) => {
-            match x.rmatch_indices('.').nth(1) {
-                // Slice is safe,
-                // because `.` is one byte
-                // `rmatch_indices` always returns valid indices,
-                // and there will always be at least one character
-                // after the second match from the right.
-                Some((i, _)) => unsafe { x.get_unchecked(i + 1..) },
-                None => x,
+mod request {
+    use crate::cache::Cache;
+    use crate::client::{Body, Response, SlowClient};
+    use crate::node::{Node, NodeParent};
+    use crate::page::Page;
+    use crate::TaskResult;
+    use indicatif::{MultiProgress, ProgressStyle};
+    use reqwest::Url;
+    use std::collections::BinaryHeap;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::task::JoinSet;
+    use url::Host::{Domain, Ipv4, Ipv6};
+
+    pub struct Runner<'a> {
+        cache: &'static Cache<Url, Result<Body, crate::client::Error>>,
+        host_resources: HostResources,
+        master_client: &'static reqwest::Client,
+        progress: &'a MultiProgress,
+        spinner_style: ProgressStyle,
+    }
+
+    type HostResources = HashMap<String, (BinaryHeap<(NodeParent<Page>, Url)>, ClientSlot)>;
+    type ClientSlot = Option<SlowClient<'static>>;
+
+    impl<'a> Runner<'a> {
+        pub fn new(
+            cache: &'static Cache<Url, Result<Body, crate::client::Error>>,
+            progress: &'a MultiProgress,
+        ) -> Self {
+            Self {
+                cache,
+                host_resources: HashMap::new(),
+                master_client: Box::leak(Box::new(
+                    reqwest::Client::builder()
+                        // `timeout` doesn't work without `connect_timeout`.
+                        .connect_timeout(core::time::Duration::from_secs(60))
+                        .timeout(core::time::Duration::from_secs(60))
+                        .build()
+                        .expect("Failed to initialize web client"),
+                )),
+                progress,
+                spinner_style: indicatif::ProgressStyle::default_bar()
+                    .template("{spinner} {wide_msg}")
+                    .unwrap(),
             }
         }
-        Some(Ipv4(_)) => u.host_str().unwrap(),
-        Some(Ipv6(_)) => u.host_str().unwrap(),
-        None => "",
+
+        pub fn redeem(
+            &mut self,
+            join_set: &mut JoinSet<TaskResult>,
+            ticket: RunTicket,
+        ) -> Result<Node<Page>, crate::client::Error> {
+            let (host, client) = ticket.1;
+            match self.host_resources.get_mut(&host) {
+                Some((urls, holding_space)) => match urls.pop() {
+                    Some((p, u)) => self.spawn(join_set, host, client, p, u),
+                    None => {
+                        debug_assert!(holding_space.is_none());
+                        _ = holding_space.insert(client);
+                    }
+                },
+                None => panic!("Host resource invariant failed"),
+            }
+            ticket.0
+        }
+
+        pub fn extend(
+            &mut self,
+            join_set: &mut JoinSet<TaskResult>,
+            parent: &Arc<Node<Page>>,
+            urls: Vec<Url>,
+        ) {
+            // TODO: add all URLs
+            // before starting request tasks,
+            // in case we have more than one URL
+            // for the same host.
+            for u in urls {
+                self.push(join_set, Some(Arc::clone(parent)), u);
+            }
+        }
+
+        pub fn push(
+            &mut self,
+            join_set: &mut JoinSet<TaskResult>,
+            parent: NodeParent<Page>,
+            url: Url,
+        ) {
+            // Making more than one request at a time
+            // to a host
+            // could result in repercussions,
+            // like IP banning.
+            // Most websites host all subdomains together,
+            // so we limit requests by domain,
+            // not FQDN.
+            let host = small_host_name(&url);
+            match self.host_resources.get_mut(host) {
+                Some((urls, client)) => match client.take() {
+                    Some(c) => self.spawn(join_set, host.to_owned(), c, parent, url),
+                    None => urls.push((parent, url)),
+                },
+                None => {
+                    let host_ = host.to_owned();
+                    self.spawn(
+                        join_set,
+                        host_.clone(),
+                        SlowClient::new(self.master_client),
+                        parent,
+                        url,
+                    );
+                    self.host_resources.insert(host_, (BinaryHeap::new(), None));
+                }
+            };
+        }
+
+        fn spawn(
+            &self,
+            join_set: &mut JoinSet<TaskResult>,
+            host: String,
+            mut client: SlowClient<'static>,
+            parent: NodeParent<Page>,
+            url: Url,
+        ) {
+            let spinner = self.progress.add(
+                indicatif::ProgressBar::new_spinner()
+                    .with_style(self.spinner_style.clone())
+                    .with_message(url.to_string()),
+            );
+            let cache = self.cache;
+            join_set.spawn(async move {
+                spinner.enable_steady_tick(Duration::from_millis(100));
+                TaskResult::Request(RunTicket(
+                    get_with_cache(cache, &mut client, &url)
+                        .await
+                        .map(|body| Node::new(parent, Page::new(url, body))),
+                    (host, client),
+                ))
+            });
+        }
     }
-}
 
-async fn get_with_cache<'a>(
-    cache: &Cache<Url, Response>,
-    client: &mut SlowClient<'a>,
-    u: &Url,
-) -> Response {
-    match cache.get(u) {
-        Some(x) => x,
-        None => get_and_cache_from_web(cache, client, u).await,
+    pub struct RunTicket(
+        Result<Node<Page>, crate::client::Error>,
+        (String, SlowClient<'static>),
+    );
+
+    fn small_host_name(u: &Url) -> &str {
+        match u.host() {
+            Some(Domain(x)) => {
+                match x.rmatch_indices('.').nth(1) {
+                    // Slice is safe,
+                    // because `.` is one byte
+                    // `rmatch_indices` always returns valid indices,
+                    // and there will always be at least one character
+                    // after the second match from the right.
+                    Some((i, _)) => unsafe { x.get_unchecked(i + 1..) },
+                    None => x,
+                }
+            }
+            Some(Ipv4(_)) => u.host_str().unwrap(),
+            Some(Ipv6(_)) => u.host_str().unwrap(),
+            None => "",
+        }
     }
-}
 
-async fn get_and_cache_from_web<'a>(
-    cache: &Cache<Url, Response>,
-    client: &mut SlowClient<'a>,
-    u: &Url,
-) -> Response {
-    let body = client.get(u).await;
+    async fn get_with_cache<'a>(
+        cache: &Cache<Url, Response>,
+        client: &mut SlowClient<'a>,
+        u: &Url,
+    ) -> Response {
+        match cache.get(u) {
+            Some(x) => x,
+            None => get_and_cache_from_web(cache, client, u).await,
+        }
+    }
 
-    // We would rather keep searching
-    // than panic
-    // or delay
-    // from failed caching.
-    let _ = cache.set(u, &body);
+    async fn get_and_cache_from_web<'a>(
+        cache: &Cache<Url, Response>,
+        client: &mut SlowClient<'a>,
+        u: &Url,
+    ) -> Response {
+        let body = client.get(u).await;
 
-    body
+        // We would rather keep searching
+        // than panic
+        // or delay
+        // from failed caching.
+        let _ = cache.set(u, &body);
+
+        body
+    }
 }
 
 mod page {
@@ -307,13 +374,13 @@ mod page {
 
         pub fn redeem(
             &mut self,
-            join_set: &mut JoinSet<TaskResult<'static>>,
-            x: RunTicket,
+            join_set: &mut JoinSet<TaskResult>,
+            ticket: RunTicket,
         ) -> RunOutput {
             self.num_tasks -= 1;
             (
-                x.0,
-                match x.1 {
+                ticket.0,
+                match ticket.1 {
                     Some((pages, bad_cache_hits, request_data)) => {
                         let good_cache_hits = pages.len();
                         self.extend(join_set, pages);
@@ -329,7 +396,7 @@ mod page {
             )
         }
 
-        fn extend(&mut self, join_set: &mut JoinSet<TaskResult<'static>>, pages: Vec<Node<Page>>) {
+        fn extend(&mut self, join_set: &mut JoinSet<TaskResult>, pages: Vec<Node<Page>>) {
             // We want to add as many pages as possible
             // before picking the best pages
             // to start as tasks,
@@ -360,7 +427,7 @@ mod page {
             }
         }
 
-        pub fn push(&mut self, join_set: &mut JoinSet<TaskResult<'static>>, page: Node<Page>) {
+        pub fn push(&mut self, join_set: &mut JoinSet<TaskResult>, page: Node<Page>) {
             if self.num_tasks < self.max_tasks {
                 debug_assert!(self.queue.is_empty());
                 self.spawn(join_set, page)
@@ -369,7 +436,7 @@ mod page {
             }
         }
 
-        fn spawn(&mut self, join_set: &mut JoinSet<TaskResult<'static>>, page: Node<Page>) {
+        fn spawn(&mut self, join_set: &mut JoinSet<TaskResult>, page: Node<Page>) {
             self.num_tasks += 1;
             let cache = self.cache;
             let max_depth = self.max_depth;
