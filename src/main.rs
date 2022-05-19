@@ -208,10 +208,18 @@ mod request {
             parent: &Arc<Node<Page>>,
             urls: Vec<Url>,
         ) {
-            // TODO: add all URLs
-            // before starting request tasks,
-            // in case we have more than one URL
-            // for the same host.
+            // If `urls` contains more than one URL for a given host,
+            // the first URL for that host may spawn a new task.
+            // However,
+            // we don't need to sort `urls`,
+            // because nodes are sorted by depth,
+            // and these URLs have the same parent
+            // and therefore the same depth.
+            // Furthermore,
+            // we don't have to worry about a queued URL for a given host
+            // having a greater value than one in `urls`,
+            // because `push` won't spawn a task for a host
+            // if URLs are queued for that host.
             for u in urls {
                 self.push(join_set, Some(Arc::clone(parent)), u);
             }
@@ -233,7 +241,10 @@ mod request {
             let host = small_host_name(&url);
             match self.host_resources.get_mut(host) {
                 Some((urls, client)) => match client.take() {
-                    Some(c) => self.spawn(join_set, host.to_owned(), c, parent, url),
+                    Some(c) => {
+                        debug_assert!(urls.is_empty());
+                        self.spawn(join_set, host.to_owned(), c, parent, url)
+                    }
                     None => urls.push((parent, url)),
                 },
                 None => {
