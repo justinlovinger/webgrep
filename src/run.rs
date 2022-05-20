@@ -6,11 +6,7 @@ use regex::Regex;
 use reqwest::Url;
 use std::fmt::Debug;
 use std::io::Write;
-
-#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
 
 pub enum TaskResult {
     Page(crate::run::page::RunTicket),
@@ -20,8 +16,7 @@ pub enum TaskResult {
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut match_writer: impl Write,
-    #[cfg(unix)] progress_writer: impl Write + Debug + AsRawFd + Send + 'static,
-    #[cfg(windows)] progress_writer: impl Write + Debug + AsRawHandle + Send + 'static,
+    progress_writer: impl Write + Debug + AsRawFd + Send + 'static,
     cache: Cache<Url, Result<Body, crate::client::Error>>,
     page_threads: usize,
     exclude_urls_re: Option<Regex>,
