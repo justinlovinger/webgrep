@@ -142,6 +142,7 @@ mod request {
     use crate::TaskResult;
     use indicatif::{MultiProgress, ProgressStyle};
     use reqwest::Url;
+    use std::cmp::Ordering;
     use std::collections::BinaryHeap;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -157,7 +158,7 @@ mod request {
         spinner_style: ProgressStyle,
     }
 
-    type HostResources = HashMap<String, (BinaryHeap<(NodeParent<Page>, Url)>, ClientSlot)>;
+    type HostResources = HashMap<String, (BinaryHeap<RequestUrl>, ClientSlot)>;
     type ClientSlot = Option<SlowClient<'static>>;
 
     impl<'a> Runner<'a> {
@@ -191,7 +192,7 @@ mod request {
             let (host, client) = ticket.1;
             match self.host_resources.get_mut(&host) {
                 Some((urls, holding_space)) => match urls.pop() {
-                    Some((p, u)) => self.spawn(join_set, host, client, p, u),
+                    Some(RequestUrl(p, u)) => self.spawn(join_set, host, client, p, u),
                     None => {
                         debug_assert!(holding_space.is_none());
                         _ = holding_space.insert(client);
@@ -245,7 +246,7 @@ mod request {
                         debug_assert!(urls.is_empty());
                         self.spawn(join_set, host.to_owned(), c, parent, url)
                     }
-                    None => urls.push((parent, url)),
+                    None => urls.push(RequestUrl(parent, url)),
                 },
                 None => {
                     let host_ = host.to_owned();
@@ -291,6 +292,43 @@ mod request {
         Result<Node<Page>, crate::client::Error>,
         (String, SlowClient<'static>),
     );
+
+    struct RequestUrl(NodeParent<Page>, Url);
+
+    impl Ord for RequestUrl {
+        fn cmp(&self, other: &Self) -> Ordering {
+            match &self.0 {
+                Some(x) => match &other.0 {
+                    Some(y) => x.depth().cmp(&y.depth()),
+                    None => Ordering::Greater,
+                },
+                None => match other.0 {
+                    Some(_) => Ordering::Less,
+                    None => Ordering::Equal,
+                },
+            }
+        }
+    }
+
+    impl PartialOrd for RequestUrl {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Eq for RequestUrl {}
+
+    impl PartialEq for RequestUrl {
+        fn eq(&self, other: &Self) -> bool {
+            match &self.0 {
+                Some(x) => match &other.0 {
+                    Some(y) => x.depth() == y.depth(),
+                    None => false,
+                },
+                None => other.0.is_none(),
+            }
+        }
+    }
 
     fn small_host_name(u: &Url) -> &str {
         match u.host() {
@@ -348,9 +386,11 @@ mod page {
     use markup5ever_rcdom::{Handle, NodeData, RcDom};
     use regex::Regex;
     use reqwest::Url;
+    use std::cmp::Ordering;
     use std::collections::BinaryHeap;
     use std::collections::HashSet;
     use std::default::Default;
+    use std::ops::Deref;
     use std::sync::Arc;
     use tokio::task::JoinSet;
 
@@ -361,7 +401,7 @@ mod page {
         exclude_urls_re: &'static Option<Regex>,
         max_tasks: usize,
         num_tasks: usize,
-        queue: BinaryHeap<Node<Page>>,
+        queue: BinaryHeap<PageNode>,
     }
 
     impl Runner {
@@ -399,7 +439,7 @@ mod page {
                     }
                     None => {
                         if let Some(page) = self.queue.pop() {
-                            self.spawn(join_set, page);
+                            self.spawn(join_set, page.into());
                         }
                         None
                     }
@@ -422,14 +462,14 @@ mod page {
                     self.spawn(join_set, page);
                 }
                 while let Some(page) = self.queue.pop() {
-                    self.spawn(join_set, page);
+                    self.spawn(join_set, page.into());
                 }
                 debug_assert!(self.queue.is_empty());
             } else {
-                self.queue.extend(pages.into_iter());
+                self.queue.extend(pages.into_iter().map(|page| page.into()));
                 for _ in 0..n {
                     match self.queue.pop() {
-                        Some(page) => self.spawn(join_set, page),
+                        Some(page) => self.spawn(join_set, page.into()),
                         None => break,
                     }
                 }
@@ -443,7 +483,7 @@ mod page {
                 debug_assert!(self.queue.is_empty());
                 self.spawn(join_set, page)
             } else {
-                self.queue.push(page)
+                self.queue.push(page.into())
             }
         }
 
@@ -472,6 +512,48 @@ mod page {
     pub type GoodCacheHits = usize;
     pub type BadCacheHits = u64;
     pub type RequestData = (Arc<Node<Page>>, Vec<Url>);
+
+    struct PageNode(Node<Page>);
+
+    impl Deref for PageNode {
+        type Target = Node<Page>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl From<Node<Page>> for PageNode {
+        fn from(page: Node<Page>) -> Self {
+            PageNode(page)
+        }
+    }
+
+    impl From<PageNode> for Node<Page> {
+        fn from(page: PageNode) -> Self {
+            page.0
+        }
+    }
+
+    impl Ord for PageNode {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.depth().cmp(&other.depth())
+        }
+    }
+
+    impl PartialOrd for PageNode {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Eq for PageNode {}
+
+    impl PartialEq for PageNode {
+        fn eq(&self, other: &Self) -> bool {
+            self.depth() == other.depth()
+        }
+    }
 
     pub struct Page {
         url: Url,

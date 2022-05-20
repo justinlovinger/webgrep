@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 pub type NodeParent<T> = Option<Arc<Node<T>>>;
@@ -35,26 +34,6 @@ impl<T> Node<T> {
             }
             None => Vec::from([&self.value]),
         }
-    }
-}
-
-impl<T> Ord for Node<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.depth().cmp(&other.depth())
-    }
-}
-
-impl<T> PartialOrd for Node<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<T> Eq for Node<T> {}
-
-impl<T> PartialEq for Node<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.depth() == other.depth()
     }
 }
 
