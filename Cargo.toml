@@ -12,6 +12,7 @@ edition = "2021"
 [dependencies]
 bincode = "1"
 clap = { version = "3", features = ["derive"] }
+console = "0.15"
 futures = "0.3"
 html5ever = "0.25"
 indicatif = "0.17.0-rc.10"
