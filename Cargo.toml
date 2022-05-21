@@ -1,5 +1,5 @@
 [package]
-name = "wg"
+name = "webgrep"
 version = "0.1.0"
 authors = ["Justin Lovinger"]
 description = "Recursively search the web, starting from URL..., for PATTERN"
@@ -8,6 +8,10 @@ license = "MIT"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+path = "src/main.rs"
+name = "wg"
 
 [dependencies]
 bincode = "1"

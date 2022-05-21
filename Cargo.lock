@@ -1512,7 +1512,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wg"
+name = "webgrep"
 version = "0.1.0"
 dependencies = [
  "bincode",
