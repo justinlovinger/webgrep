@@ -1,9 +1,3 @@
-mod cache;
-mod client;
-mod node;
-mod run;
-
-use crate::cache::Cache;
 use clap::Parser;
 use regex::{Regex, RegexBuilder};
 use reqwest::Url;
@@ -36,10 +30,10 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    crate::run::run(
+    webgrep::run(
         std::io::stdout(),
         std::io::stderr(),
-        Cache::new("page-cache")
+        webgrep::Cache::new("page-cache")
             .await
             .expect("Failed to initialize cache"),
         // Tokio uses number of CPU cores as default number of worker threads.
