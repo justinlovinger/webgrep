@@ -1,5 +1,5 @@
 use crate::cache::Cache;
-use crate::client::Body;
+use crate::client::Response;
 use crate::node::Node;
 use crate::run::page::Page;
 use regex::Regex;
@@ -17,7 +17,7 @@ pub enum TaskResult {
 pub async fn run(
     mut match_writer: impl Write,
     progress_writer: impl Write + Debug + AsRawFd + Send + 'static,
-    cache: impl Cache<Url, Result<Body, crate::client::Error>> + Sync + 'static,
+    cache: impl Cache<Url, Response> + Sync + 'static,
     page_threads: usize,
     exclude_urls_re: Option<Regex>,
     max_depth: u64,
@@ -105,7 +105,7 @@ pub async fn run(
 
 mod request {
     use crate::cache::Cache;
-    use crate::client::{Body, Response, SlowClient};
+    use crate::client::{Response, SlowClient};
     use crate::node::{Node, NodeParent};
     use crate::run::page::Page;
     use crate::run::TaskResult;
@@ -119,8 +119,8 @@ mod request {
     use tokio::task::JoinSet;
     use url::Host::{Domain, Ipv4, Ipv6};
 
-    pub struct Runner<'a> {
-        cache: &'static (dyn Cache<Url, Result<Body, crate::client::Error>> + Sync),
+    pub struct Runner<'a, C: Cache<Url, Response> + Sync + 'static> {
+        cache: &'static C,
         host_resources: HostResources,
         master_client: &'static reqwest::Client,
         progress: &'a MultiProgress,
@@ -130,11 +130,8 @@ mod request {
     type HostResources = HashMap<String, (BinaryHeap<RequestUrl>, ClientSlot)>;
     type ClientSlot = Option<SlowClient<'static>>;
 
-    impl<'a> Runner<'a> {
-        pub fn new(
-            cache: &'static (impl Cache<Url, Result<Body, crate::client::Error>> + Sync),
-            progress: &'a MultiProgress,
-        ) -> Self {
+    impl<'a, C: Cache<Url, Response> + Sync> Runner<'a, C> {
+        pub fn new(cache: &'static C, progress: &'a MultiProgress) -> Self {
             Self {
                 cache,
                 host_resources: HashMap::new(),
@@ -319,7 +316,7 @@ mod request {
     }
 
     async fn get_with_cache<'a>(
-        cache: &(dyn Cache<Url, Response> + Sync),
+        cache: &(impl Cache<Url, Response> + Sync),
         client: &mut SlowClient<'a>,
         u: &Url,
     ) -> Response {
@@ -330,7 +327,7 @@ mod request {
     }
 
     async fn get_and_cache_from_web<'a>(
-        cache: &(dyn Cache<Url, Response> + Sync),
+        cache: &impl Cache<Url, Response>,
         client: &mut SlowClient<'a>,
         u: &Url,
     ) -> Response {
@@ -363,8 +360,8 @@ mod page {
     use std::sync::Arc;
     use tokio::task::JoinSet;
 
-    pub struct Runner {
-        cache: &'static (dyn Cache<Url, Result<Body, crate::client::Error>> + Sync),
+    pub struct Runner<C: Cache<Url, Response> + Sync + 'static> {
+        cache: &'static C,
         max_depth: u64,
         search_re: &'static Regex,
         exclude_urls_re: &'static Option<Regex>,
@@ -373,9 +370,9 @@ mod page {
         queue: BinaryHeap<PageNode>,
     }
 
-    impl Runner {
+    impl<C: Cache<Url, Response> + Sync> Runner<C> {
         pub fn new(
-            cache: &'static (impl Cache<Url, Result<Body, crate::client::Error>> + Sync),
+            cache: &'static C,
             max_depth: u64,
             search_re: Regex,
             exclude_urls_re: Option<Regex>,
@@ -542,7 +539,7 @@ mod page {
     }
 
     fn parse_page(
-        cache: &dyn Cache<Url, Response>,
+        cache: &impl Cache<Url, Response>,
         max_depth: u64,
         search_re: &Regex,
         exclude_urls_re: &Option<Regex>,
