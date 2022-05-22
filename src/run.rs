@@ -4,9 +4,7 @@ use crate::node::Node;
 use crate::run::page::Page;
 use regex::Regex;
 use reqwest::Url;
-use std::fmt::Debug;
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
 
 pub enum TaskResult {
     Page(crate::run::page::RunTicket),
@@ -16,7 +14,7 @@ pub enum TaskResult {
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut match_writer: impl Write,
-    progress_writer: impl Write + Debug + AsRawFd + Send + 'static,
+    progress: indicatif::MultiProgress,
     cache: impl Cache<Url, Response> + Sync + 'static,
     page_threads: usize,
     exclude_urls_re: Option<Regex>,
@@ -24,12 +22,6 @@ pub async fn run(
     search_re: Regex,
     urls: Vec<Url>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let progress = indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::term(
-        // Progress bars shouldn't write,
-        // so writer here doesn't matter.
-        console::Term::read_write_pair(std::io::stdin(), progress_writer),
-        15,
-    ));
     let progress_style = indicatif::ProgressStyle::default_bar()
         .template("{wide_bar} {pos:>7}/{len:<7} {msg}")
         .unwrap();
