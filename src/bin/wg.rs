@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     webgrep::run(
         std::io::stdout(),
         std::io::stderr(),
-        webgrep::Cache::new("page-cache")
+        webgrep::cache::FileCache::new("page-cache")
             .await
             .expect("Failed to initialize cache"),
         // Tokio uses number of CPU cores as default number of worker threads.

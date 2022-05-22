@@ -17,7 +17,7 @@ pub enum TaskResult {
 pub async fn run(
     mut match_writer: impl Write,
     progress_writer: impl Write + Debug + AsRawFd + Send + 'static,
-    cache: Cache<Url, Result<Body, crate::client::Error>>,
+    cache: impl Cache<Url, Result<Body, crate::client::Error>> + Sync + 'static,
     page_threads: usize,
     exclude_urls_re: Option<Regex>,
     max_depth: u64,
@@ -120,7 +120,7 @@ mod request {
     use url::Host::{Domain, Ipv4, Ipv6};
 
     pub struct Runner<'a> {
-        cache: &'static Cache<Url, Result<Body, crate::client::Error>>,
+        cache: &'static (dyn Cache<Url, Result<Body, crate::client::Error>> + Sync),
         host_resources: HostResources,
         master_client: &'static reqwest::Client,
         progress: &'a MultiProgress,
@@ -132,7 +132,7 @@ mod request {
 
     impl<'a> Runner<'a> {
         pub fn new(
-            cache: &'static Cache<Url, Result<Body, crate::client::Error>>,
+            cache: &'static (impl Cache<Url, Result<Body, crate::client::Error>> + Sync),
             progress: &'a MultiProgress,
         ) -> Self {
             Self {
@@ -319,7 +319,7 @@ mod request {
     }
 
     async fn get_with_cache<'a>(
-        cache: &Cache<Url, Response>,
+        cache: &(dyn Cache<Url, Response> + Sync),
         client: &mut SlowClient<'a>,
         u: &Url,
     ) -> Response {
@@ -330,7 +330,7 @@ mod request {
     }
 
     async fn get_and_cache_from_web<'a>(
-        cache: &Cache<Url, Response>,
+        cache: &(dyn Cache<Url, Response> + Sync),
         client: &mut SlowClient<'a>,
         u: &Url,
     ) -> Response {
@@ -364,7 +364,7 @@ mod page {
     use tokio::task::JoinSet;
 
     pub struct Runner {
-        cache: &'static Cache<Url, Result<Body, crate::client::Error>>,
+        cache: &'static (dyn Cache<Url, Result<Body, crate::client::Error>> + Sync),
         max_depth: u64,
         search_re: &'static Regex,
         exclude_urls_re: &'static Option<Regex>,
@@ -375,7 +375,7 @@ mod page {
 
     impl Runner {
         pub fn new(
-            cache: &'static Cache<Url, Result<Body, crate::client::Error>>,
+            cache: &'static (impl Cache<Url, Result<Body, crate::client::Error>> + Sync),
             max_depth: u64,
             search_re: Regex,
             exclude_urls_re: Option<Regex>,
@@ -542,7 +542,7 @@ mod page {
     }
 
     fn parse_page(
-        cache: &Cache<Url, Response>,
+        cache: &dyn Cache<Url, Response>,
         max_depth: u64,
         search_re: &Regex,
         exclude_urls_re: &Option<Regex>,
