@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     webgrep::run(
-        std::io::stdout(),
+        std::io::BufWriter::new(std::io::stdout()),
         indicatif::MultiProgress::new(),
         webgrep::cache::FileCache::new("page-cache")
             .await
