@@ -1,14 +1,14 @@
 use crate::cache::Cache;
-use crate::client::Response;
+use crate::client::{Client, Response};
 use crate::node::Node;
 use crate::run::page::Page;
 use regex::Regex;
 use reqwest::Url;
 use std::io::Write;
 
-pub enum TaskResult {
+pub enum TaskResult<L: Client + 'static> {
     Page(crate::run::page::RunTicket),
-    Request(crate::run::request::RunTicket),
+    Request(crate::run::request::RunTicket<L>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16,6 +16,7 @@ pub async fn run(
     mut match_writer: impl Write,
     progress: indicatif::MultiProgress,
     cache: impl Cache<Url, Response> + Sync + 'static,
+    client: impl Client + Sync + 'static,
     page_threads: usize,
     exclude_urls_re: Option<Regex>,
     max_depth: u64,
@@ -45,7 +46,7 @@ pub async fn run(
     let mut page_runner =
         crate::run::page::Runner::new(cache_, max_depth, search_re, exclude_urls_re, page_threads);
 
-    let mut request_runner = crate::run::request::Runner::new(cache_, &progress);
+    let mut request_runner = crate::run::request::Runner::new(cache_, client, &progress);
 
     urls.into_iter().for_each(|u| match cache_.get(&u) {
         Some(Ok(body)) => page_runner.push(&mut tasks, Node::new(None, Page::new(u, body))),
@@ -97,7 +98,7 @@ pub async fn run(
 
 mod request {
     use crate::cache::Cache;
-    use crate::client::{Response, SlowClient};
+    use crate::client::{self, Client, Response};
     use crate::node::{Node, NodeParent};
     use crate::run::page::Page;
     use crate::run::TaskResult;
@@ -107,34 +108,27 @@ mod request {
     use std::collections::BinaryHeap;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::task::JoinSet;
     use url::Host::{Domain, Ipv4, Ipv6};
 
-    pub struct Runner<'a, C: Cache<Url, Response> + Sync + 'static> {
+    pub struct Runner<'a, C: Cache<Url, Response> + 'static, L: Client + 'static> {
         cache: &'static C,
-        host_resources: HostResources,
-        master_client: &'static reqwest::Client,
+        host_resources: HostResources<L>,
+        master_client: &'static L,
         progress: &'a MultiProgress,
         spinner_style: ProgressStyle,
     }
 
-    type HostResources = HashMap<String, (BinaryHeap<RequestUrl>, ClientSlot)>;
-    type ClientSlot = Option<SlowClient<'static>>;
+    type HostResources<L> = HashMap<String, (BinaryHeap<RequestUrl>, ClientSlot<L>)>;
+    type ClientSlot<L> = Option<SlowClient<'static, L>>;
 
-    impl<'a, C: Cache<Url, Response> + Sync> Runner<'a, C> {
-        pub fn new(cache: &'static C, progress: &'a MultiProgress) -> Self {
+    impl<'a, C: Cache<Url, Response> + Sync, L: Client + Sync> Runner<'a, C, L> {
+        pub fn new(cache: &'static C, client: L, progress: &'a MultiProgress) -> Self {
             Self {
                 cache,
                 host_resources: HashMap::new(),
-                master_client: Box::leak(Box::new(
-                    reqwest::Client::builder()
-                        // `timeout` doesn't work without `connect_timeout`.
-                        .connect_timeout(core::time::Duration::from_secs(60))
-                        .timeout(core::time::Duration::from_secs(60))
-                        .build()
-                        .expect("Failed to initialize web client"),
-                )),
+                master_client: Box::leak(Box::new(client)),
                 progress,
                 spinner_style: indicatif::ProgressStyle::default_bar()
                     .template("{spinner} {wide_msg}")
@@ -144,9 +138,9 @@ mod request {
 
         pub fn redeem(
             &mut self,
-            join_set: &mut JoinSet<TaskResult>,
-            ticket: RunTicket,
-        ) -> Result<Node<Page>, crate::client::Error> {
+            join_set: &mut JoinSet<TaskResult<L>>,
+            ticket: RunTicket<L>,
+        ) -> Result<Node<Page>, client::Error> {
             let (host, client) = ticket.1;
             match self.host_resources.get_mut(&host) {
                 Some((urls, holding_space)) => match urls.pop() {
@@ -163,7 +157,7 @@ mod request {
 
         pub fn extend(
             &mut self,
-            join_set: &mut JoinSet<TaskResult>,
+            join_set: &mut JoinSet<TaskResult<L>>,
             parent: &Arc<Node<Page>>,
             urls: Vec<Url>,
         ) {
@@ -186,7 +180,7 @@ mod request {
 
         pub fn push(
             &mut self,
-            join_set: &mut JoinSet<TaskResult>,
+            join_set: &mut JoinSet<TaskResult<L>>,
             parent: NodeParent<Page>,
             url: Url,
         ) {
@@ -222,9 +216,9 @@ mod request {
 
         fn spawn(
             &self,
-            join_set: &mut JoinSet<TaskResult>,
+            join_set: &mut JoinSet<TaskResult<L>>,
             host: String,
-            mut client: SlowClient<'static>,
+            mut client: SlowClient<'static, L>,
             parent: NodeParent<Page>,
             url: Url,
         ) {
@@ -246,9 +240,9 @@ mod request {
         }
     }
 
-    pub struct RunTicket(
-        Result<Node<Page>, crate::client::Error>,
-        (String, SlowClient<'static>),
+    pub struct RunTicket<L: Client + 'static>(
+        Result<Node<Page>, client::Error>,
+        (String, SlowClient<'static, L>),
     );
 
     struct RequestUrl(NodeParent<Page>, Url);
@@ -288,8 +282,8 @@ mod request {
         }
     }
 
-    fn small_host_name(u: &Url) -> &str {
-        match u.host() {
+    fn small_host_name(url: &Url) -> &str {
+        match url.host() {
             Some(Domain(x)) => {
                 match x.rmatch_indices('.').nth(1) {
                     // Slice is safe,
@@ -301,43 +295,77 @@ mod request {
                     None => x,
                 }
             }
-            Some(Ipv4(_)) => u.host_str().unwrap(),
-            Some(Ipv6(_)) => u.host_str().unwrap(),
+            Some(Ipv4(_)) => url.host_str().unwrap(),
+            Some(Ipv6(_)) => url.host_str().unwrap(),
             None => "",
         }
     }
 
     async fn get_with_cache<'a>(
-        cache: &(impl Cache<Url, Response> + Sync),
-        client: &mut SlowClient<'a>,
-        u: &Url,
+        cache: &impl Cache<Url, Response>,
+        client: &mut SlowClient<'a, impl Client>,
+        url: &Url,
     ) -> Response {
-        match cache.get(u) {
+        match cache.get(url) {
             Some(x) => x,
-            None => get_and_cache_from_web(cache, client, u).await,
+            None => get_and_cache_from_web(cache, client, url).await,
         }
     }
 
     async fn get_and_cache_from_web<'a>(
         cache: &impl Cache<Url, Response>,
-        client: &mut SlowClient<'a>,
-        u: &Url,
+        client: &mut SlowClient<'a, impl Client>,
+        url: &Url,
     ) -> Response {
-        let body = client.get(u).await;
+        let body = client.get(url).await;
 
         // We would rather keep searching
         // than panic
         // or delay
         // from failed caching.
-        let _ = cache.set(u, &body);
+        let _ = cache.set(url, &body);
 
         body
+    }
+
+    pub struct SlowClient<'a, L: Client> {
+        client: &'a L,
+        last_request_finished: Option<Instant>,
+    }
+
+    impl<'a, L: Client> SlowClient<'a, L> {
+        pub fn new(client: &'a L) -> Self {
+            Self {
+                client,
+                last_request_finished: None,
+            }
+        }
+
+        pub fn time_remaining(&self) -> Duration {
+            self.last_request_finished
+                .and_then(|x| Duration::from_secs(1).checked_sub(x.elapsed()))
+                .unwrap_or(Duration::ZERO)
+        }
+
+        pub async fn get(&mut self, url: &Url) -> Response {
+            // Making web requests
+            // at the speed of a computer
+            // can have negative repercussions,
+            // like IP banning.
+            let time_remaining = self.time_remaining();
+            if time_remaining > Duration::ZERO {
+                tokio::time::sleep(time_remaining).await;
+            }
+            let body = self.client.get(url).await;
+            self.last_request_finished = Some(Instant::now());
+            body
+        }
     }
 }
 
 mod page {
     use crate::cache::Cache;
-    use crate::client::{Body, Response};
+    use crate::client::{Body, Client, Response};
     use crate::node::{path_to_root, Node};
     use crate::run::TaskResult;
     use html5ever::tendril::TendrilSink;
@@ -352,7 +380,7 @@ mod page {
     use std::sync::Arc;
     use tokio::task::JoinSet;
 
-    pub struct Runner<C: Cache<Url, Response> + Sync + 'static> {
+    pub struct Runner<C: Cache<Url, Response> + 'static> {
         cache: &'static C,
         max_depth: u64,
         search_re: &'static Regex,
@@ -383,7 +411,7 @@ mod page {
 
         pub fn redeem(
             &mut self,
-            join_set: &mut JoinSet<TaskResult>,
+            join_set: &mut JoinSet<TaskResult<impl Client + Sync>>,
             ticket: RunTicket,
         ) -> RunOutput {
             self.num_tasks -= 1;
@@ -405,7 +433,11 @@ mod page {
             )
         }
 
-        fn extend(&mut self, join_set: &mut JoinSet<TaskResult>, pages: Vec<Node<Page>>) {
+        fn extend(
+            &mut self,
+            join_set: &mut JoinSet<TaskResult<impl Client + Sync>>,
+            pages: Vec<Node<Page>>,
+        ) {
             // We want to add as many pages as possible
             // before picking the best pages
             // to start as tasks,
@@ -436,7 +468,11 @@ mod page {
             }
         }
 
-        pub fn push(&mut self, join_set: &mut JoinSet<TaskResult>, page: Node<Page>) {
+        pub fn push(
+            &mut self,
+            join_set: &mut JoinSet<TaskResult<impl Client + Sync>>,
+            page: Node<Page>,
+        ) {
             if self.num_tasks < self.max_tasks {
                 debug_assert!(self.queue.is_empty());
                 self.spawn(join_set, page)
@@ -445,7 +481,11 @@ mod page {
             }
         }
 
-        fn spawn(&mut self, join_set: &mut JoinSet<TaskResult>, page: Node<Page>) {
+        fn spawn(
+            &mut self,
+            join_set: &mut JoinSet<TaskResult<impl Client + Sync>>,
+            page: Node<Page>,
+        ) {
             self.num_tasks += 1;
             let cache = self.cache;
             let max_depth = self.max_depth;

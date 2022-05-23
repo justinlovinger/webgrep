@@ -36,6 +36,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         webgrep::cache::FileCache::new("page-cache")
             .await
             .expect("Failed to initialize cache"),
+        reqwest::Client::builder()
+            // `timeout` doesn't work without `connect_timeout`.
+            .connect_timeout(core::time::Duration::from_secs(60))
+            .timeout(core::time::Duration::from_secs(60))
+            .build()
+            .expect("Failed to initialize web client"),
         // Tokio uses number of CPU cores as default number of worker threads.
         // `tokio::runtime::Handle::current().metrics().num_workers()`
         // is only available in unstable Tokio.

@@ -1,5 +1,5 @@
 pub mod cache;
-mod client;
+pub mod client;
 mod node;
 mod run;
 

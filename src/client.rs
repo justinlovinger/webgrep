@@ -1,6 +1,5 @@
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
 
 const BODY_SIZE_LIMIT: u64 = 104857600; // bytes
 
@@ -57,29 +56,15 @@ impl From<reqwest::Error> for ReqwestError {
     }
 }
 
-pub struct SlowClient<'a> {
-    client: &'a reqwest::Client,
-    last_request_finished: Option<Instant>,
+#[async_trait::async_trait]
+pub trait Client {
+    async fn get(&self, url: &Url) -> Response;
 }
 
-impl<'a> SlowClient<'a> {
-    pub fn new(client: &'a reqwest::Client) -> Self {
-        Self {
-            client,
-            last_request_finished: None,
-        }
-    }
-
-    pub async fn get(&mut self, u: &Url) -> Response {
-        // Making web requests
-        // at the speed of a computer
-        // can have negative repercussions,
-        // like IP banning.
-        let time_remaining = self.time_remaining();
-        if time_remaining > Duration::ZERO {
-            tokio::time::sleep(time_remaining).await;
-        }
-        let body = match self.client.get(u.as_ref()).send().await {
+#[async_trait::async_trait]
+impl Client for reqwest::Client {
+    async fn get(&self, url: &Url) -> Response {
+        match self.get(url.as_ref()).send().await {
             Ok(r) => {
                 // The default `content-type` is `application/octet-stream`,
                 // <https://www.w3.org/Protocols/rfc2616/rfc2616-sec7.html#sec7.2.1>.
@@ -98,15 +83,7 @@ impl<'a> SlowClient<'a> {
                 }
             }
             Err(e) => Err(Error::Other(e.into())),
-        };
-        self.last_request_finished = Some(Instant::now());
-        body
-    }
-
-    pub fn time_remaining(&self) -> Duration {
-        self.last_request_finished
-            .and_then(|x| Duration::from_secs(1).checked_sub(x.elapsed()))
-            .unwrap_or(Duration::ZERO)
+        }
     }
 }
 
