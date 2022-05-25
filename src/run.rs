@@ -369,6 +369,7 @@ mod page {
     use crate::node::{path_to_root, Node};
     use crate::run::TaskResult;
     use html5ever::tendril::TendrilSink;
+    use itertools::Itertools;
     use markup5ever_rcdom::{Handle, NodeData, RcDom};
     use regex::Regex;
     use reqwest::Url;
@@ -643,13 +644,9 @@ mod page {
     }
 
     fn display_node_path(node: &Node<Page>) -> String {
-        // `map(...).intersperse(" > ")` would be better,
-        // but it is only available in nightly builds,
-        // as of 2022-04-18.
         node.path_from_root()
             .iter()
             .map(|x| x.url.as_str())
-            .collect::<Vec<_>>()
             .join(" > ")
     }
 

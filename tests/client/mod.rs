@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use rand::distributions::{Distribution, Uniform};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
@@ -43,7 +44,6 @@ impl Client for PseudorandomClient {
                     i
                 )
             })
-            .collect::<Vec<_>>()
             .join("");
         Ok(Body::Html(links))
     }
