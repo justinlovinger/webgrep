@@ -8,6 +8,7 @@ use regex::Regex;
 use reqwest::Url;
 use std::collections::HashMap;
 use std::num::{NonZeroU16, NonZeroUsize};
+use std::time::Duration;
 use webgrep::run;
 
 // TODO: Add `ClientWithUrl` with `Arbitrary` instance
@@ -32,7 +33,7 @@ fn run_is_idempotent_with_partial_cache() {
 async fn run_finds_the_same_matches_with_empty_or_full_cache(
     min_links_: u8,
     links_delta: u8,
-    domains_: NonZeroU16,
+    domains: NonZeroU16,
     paths_per_domain: NonZeroU16,
     page_threads: NonZeroUsize,
     max_depth_: u64,
@@ -48,9 +49,6 @@ async fn run_finds_the_same_matches_with_empty_or_full_cache(
     // can result in excessive time and memory usage.
     let min_links = min_links_ % 5;
     let max_links = min_links + links_delta % 5;
-    // Requests may be very slow
-    // if we don't have enough unique domains.
-    let domains = std::cmp::min(NonZeroU16::new(1000).unwrap(), domains_);
     let client = mk_static(PseudorandomClient::new(
         min_links,
         max_links,
@@ -71,12 +69,13 @@ async fn run_finds_the_same_matches_with_empty_or_full_cache(
 
     let search_re = mk_static(Regex::new(".").unwrap());
 
-    let mut first_buffer = Vec::new();
+    let mut buffer_one = Vec::new();
     run(
-        &mut first_buffer,
+        &mut buffer_one,
         progress.clone(),
         cache,
         client,
+        Duration::ZERO,
         page_threads,
         exclude_urls_re,
         max_depth,
@@ -86,12 +85,13 @@ async fn run_finds_the_same_matches_with_empty_or_full_cache(
     .await
     .unwrap();
 
-    let mut second_buffer = Vec::new();
+    let mut buffer_two = Vec::new();
     run(
-        &mut second_buffer,
+        &mut buffer_two,
         progress,
         cache,
         client,
+        Duration::ZERO,
         page_threads,
         exclude_urls_re,
         max_depth,
@@ -101,10 +101,7 @@ async fn run_finds_the_same_matches_with_empty_or_full_cache(
     .await
     .unwrap();
 
-    assert_eq!(
-        line_occurences(&first_buffer),
-        line_occurences(&second_buffer)
-    );
+    assert_eq!(line_occurences(&buffer_one), line_occurences(&buffer_two));
 
     // Static references won't automatically clear memory.
     cache.clear();

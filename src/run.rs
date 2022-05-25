@@ -6,6 +6,7 @@ use regex::Regex;
 use reqwest::Url;
 use std::io::Write;
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 pub enum TaskResult<L: Client + 'static> {
     Page(crate::run::page::RunTicket),
@@ -18,6 +19,7 @@ pub async fn run(
     progress: indicatif::MultiProgress,
     cache: &'static (impl Cache<Url, Response> + Sync),
     client: &'static (impl Client + Sync),
+    request_delay: Duration,
     page_threads: NonZeroUsize,
     exclude_urls_re: &'static Option<Regex>,
     max_depth: u64,
@@ -45,7 +47,8 @@ pub async fn run(
     let mut page_runner =
         crate::run::page::Runner::new(cache, max_depth, search_re, exclude_urls_re, page_threads);
 
-    let mut request_runner = crate::run::request::Runner::new(cache, client, &progress);
+    let mut request_runner =
+        crate::run::request::Runner::new(cache, client, request_delay, &progress);
 
     urls.into_iter().for_each(|u| match cache.get(&u) {
         Some(Ok(body)) => page_runner.push(&mut tasks, Node::new(None, Page::new(u, body))),
@@ -113,6 +116,7 @@ mod request {
 
     pub struct Runner<'a, C: Cache<Url, Response> + 'static, L: Client + 'static> {
         cache: &'static C,
+        delay: Duration,
         host_resources: HostResources<L>,
         master_client: &'static L,
         progress: &'a MultiProgress,
@@ -123,9 +127,15 @@ mod request {
     type ClientSlot<L> = Option<SlowClient<'static, L>>;
 
     impl<'a, C: Cache<Url, Response> + Sync, L: Client + Sync> Runner<'a, C, L> {
-        pub fn new(cache: &'static C, client: &'static L, progress: &'a MultiProgress) -> Self {
+        pub fn new(
+            cache: &'static C,
+            client: &'static L,
+            delay: Duration,
+            progress: &'a MultiProgress,
+        ) -> Self {
             Self {
                 cache,
+                delay,
                 host_resources: HashMap::new(),
                 master_client: client,
                 progress,
@@ -204,7 +214,7 @@ mod request {
                     self.spawn(
                         join_set,
                         host_.clone(),
-                        SlowClient::new(self.master_client),
+                        SlowClient::new(self.master_client, self.delay),
                         parent,
                         url,
                     );
@@ -329,14 +339,15 @@ mod request {
 
     pub struct SlowClient<'a, L: Client> {
         client: &'a L,
+        delay: Duration,
         last_request_finished: Option<Instant>,
     }
 
     impl<'a, L: Client> SlowClient<'a, L> {
-        // TODO: make delay duration an argument.
-        pub fn new(client: &'a L) -> Self {
+        pub fn new(client: &'a L, delay: Duration) -> Self {
             Self {
                 client,
+                delay,
                 last_request_finished: None,
             }
         }
@@ -357,7 +368,7 @@ mod request {
 
         pub fn time_remaining(&self) -> Duration {
             self.last_request_finished
-                .and_then(|x| Duration::from_secs(1).checked_sub(x.elapsed()))
+                .and_then(|x| self.delay.checked_sub(x.elapsed()))
                 .unwrap_or(Duration::ZERO)
         }
     }

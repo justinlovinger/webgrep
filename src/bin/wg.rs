@@ -2,6 +2,7 @@ use clap::Parser;
 use regex::{Regex, RegexBuilder};
 use reqwest::Url;
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -47,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()
                 .expect("Failed to initialize web client"),
         ),
+        Duration::from_secs(1),
         // Tokio uses number of CPU cores as default number of worker threads.
         // `tokio::runtime::Handle::current().metrics().num_workers()`
         // is only available in unstable Tokio.
