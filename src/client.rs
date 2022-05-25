@@ -5,21 +5,21 @@ const BODY_SIZE_LIMIT: u64 = 104857600; // bytes
 
 pub type Response = Result<Body, Error>;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Body {
     Html(String),
     Pdf(String),
     Plain(String),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Error {
     InvalidContentType(String),
     ContentLengthTooLong(Option<u64>),
     Other(ReqwestError),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum ReqwestError {
     Builder,
     Redirect,

@@ -5,6 +5,7 @@ use crate::run::page::Page;
 use regex::Regex;
 use reqwest::Url;
 use std::io::Write;
+use std::num::NonZeroUsize;
 
 pub enum TaskResult<L: Client + 'static> {
     Page(crate::run::page::RunTicket),
@@ -15,12 +16,12 @@ pub enum TaskResult<L: Client + 'static> {
 pub async fn run(
     mut match_writer: impl Write,
     progress: indicatif::MultiProgress,
-    cache: impl Cache<Url, Response> + Sync + 'static,
-    client: impl Client + Sync + 'static,
-    page_threads: usize,
-    exclude_urls_re: Option<Regex>,
+    cache: &'static (impl Cache<Url, Response> + Sync),
+    client: &'static (impl Client + Sync),
+    page_threads: NonZeroUsize,
+    exclude_urls_re: &'static Option<Regex>,
     max_depth: u64,
-    search_re: Regex,
+    search_re: &'static Regex,
     urls: Vec<Url>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let progress_style = indicatif::ProgressStyle::default_bar()
@@ -39,16 +40,14 @@ pub async fn run(
             .with_finish(indicatif::ProgressFinish::AndLeave),
     );
 
-    let cache_: &'static _ = Box::leak(Box::new(cache));
-
     let mut tasks = tokio::task::JoinSet::new();
 
     let mut page_runner =
-        crate::run::page::Runner::new(cache_, max_depth, search_re, exclude_urls_re, page_threads);
+        crate::run::page::Runner::new(cache, max_depth, search_re, exclude_urls_re, page_threads);
 
-    let mut request_runner = crate::run::request::Runner::new(cache_, client, &progress);
+    let mut request_runner = crate::run::request::Runner::new(cache, client, &progress);
 
-    urls.into_iter().for_each(|u| match cache_.get(&u) {
+    urls.into_iter().for_each(|u| match cache.get(&u) {
         Some(Ok(body)) => page_runner.push(&mut tasks, Node::new(None, Page::new(u, body))),
         Some(Err(_)) => pages_progress.inc(1),
         None => {
@@ -124,11 +123,11 @@ mod request {
     type ClientSlot<L> = Option<SlowClient<'static, L>>;
 
     impl<'a, C: Cache<Url, Response> + Sync, L: Client + Sync> Runner<'a, C, L> {
-        pub fn new(cache: &'static C, client: L, progress: &'a MultiProgress) -> Self {
+        pub fn new(cache: &'static C, client: &'static L, progress: &'a MultiProgress) -> Self {
             Self {
                 cache,
                 host_resources: HashMap::new(),
-                master_client: Box::leak(Box::new(client)),
+                master_client: client,
                 progress,
                 spinner_style: indicatif::ProgressStyle::default_bar()
                     .template("{spinner} {wide_msg}")
@@ -334,17 +333,12 @@ mod request {
     }
 
     impl<'a, L: Client> SlowClient<'a, L> {
+        // TODO: make delay duration an argument.
         pub fn new(client: &'a L) -> Self {
             Self {
                 client,
                 last_request_finished: None,
             }
-        }
-
-        pub fn time_remaining(&self) -> Duration {
-            self.last_request_finished
-                .and_then(|x| Duration::from_secs(1).checked_sub(x.elapsed()))
-                .unwrap_or(Duration::ZERO)
         }
 
         pub async fn get(&mut self, url: &Url) -> Response {
@@ -359,6 +353,12 @@ mod request {
             let body = self.client.get(url).await;
             self.last_request_finished = Some(Instant::now());
             body
+        }
+
+        pub fn time_remaining(&self) -> Duration {
+            self.last_request_finished
+                .and_then(|x| Duration::from_secs(1).checked_sub(x.elapsed()))
+                .unwrap_or(Duration::ZERO)
         }
     }
 }
@@ -376,6 +376,7 @@ mod page {
     use std::collections::BinaryHeap;
     use std::collections::HashSet;
     use std::default::Default;
+    use std::num::NonZeroUsize;
     use std::ops::Deref;
     use std::sync::Arc;
     use tokio::task::JoinSet;
@@ -394,16 +395,16 @@ mod page {
         pub fn new(
             cache: &'static C,
             max_depth: u64,
-            search_re: Regex,
-            exclude_urls_re: Option<Regex>,
-            max_tasks: usize,
+            search_re: &'static Regex,
+            exclude_urls_re: &'static Option<Regex>,
+            max_tasks: NonZeroUsize,
         ) -> Self {
             Self {
                 cache,
                 max_depth,
-                search_re: Box::leak(Box::new(search_re)),
-                exclude_urls_re: Box::leak(Box::new(exclude_urls_re)),
-                max_tasks,
+                search_re,
+                exclude_urls_re,
+                max_tasks: max_tasks.get(),
                 num_tasks: 0,
                 queue: BinaryHeap::new(),
             }
