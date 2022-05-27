@@ -14,6 +14,37 @@ use std::time::Duration;
 use webgrep::client::Response;
 use webgrep::run;
 
+const MAX_MAX_DEPTH: u64 = 2;
+
+#[derive(Clone, Debug)]
+struct RunParamsWithReducedDepth {
+    run_params: RunParams,
+    reduced_depth: u64,
+}
+
+impl RunParamsWithReducedDepth {
+    pub fn get(&self) -> &RunParams {
+        &self.run_params
+    }
+
+    pub fn get_reduced(&self) -> RunParams {
+        let mut run_params = self.run_params.clone();
+        run_params.max_depth = self.reduced_depth;
+        run_params
+    }
+}
+
+impl Arbitrary for RunParamsWithReducedDepth {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let mut run_params = RunParams::arbitrary(g);
+        run_params.max_depth = u64::arbitrary(g) % MAX_MAX_DEPTH + 1;
+        Self {
+            reduced_depth: u64::arbitrary(g) % run_params.max_depth,
+            run_params,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RunParams {
     client: &'static PseudorandomClient,
@@ -42,7 +73,7 @@ impl Arbitrary for RunParams {
             )),
             page_threads: NonZeroUsize::arbitrary(g),
             exclude_urls_re: mk_static(None),
-            max_depth: u64::arbitrary(g) % 3,
+            max_depth: u64::arbitrary(g) % (MAX_MAX_DEPTH + 1),
             search_re: mk_static(Regex::new(".").unwrap()),
             urls: repeat_with(|| {
                 // Starting URLs should be in the same set of URLs
@@ -82,9 +113,17 @@ async fn run_is_idempotent_with_full_cache(run_params: RunParams) {
     cache.clear();
 }
 
-#[test]
-fn run_is_idempotent_with_partial_cache() {
-    assert!(true);
+#[quickcheck_async::tokio]
+async fn run_is_idempotent_with_partial_cache(run_params: RunParamsWithReducedDepth) {
+    let cache1 = mk_static(MemCache::new());
+    run_(&run_params.get_reduced(), cache1).await;
+    let cache2 = cache1.clone();
+    assert_eq!(
+        line_occurences(&run_(run_params.get(), cache1).await),
+        line_occurences(&run_(run_params.get(), cache2).await)
+    );
+    cache1.clear();
+    cache2.clear();
 }
 
 #[quickcheck_async::tokio]
@@ -97,9 +136,19 @@ async fn run_finds_the_same_matches_with_empty_or_full_cache(run_params: RunPara
     cache.clear();
 }
 
-#[test]
-fn run_finds_the_same_matches_with_empty_or_partial_cache() {
-    assert!(true);
+#[quickcheck_async::tokio]
+async fn run_finds_the_same_matches_with_empty_or_partial_cache(
+    run_params: RunParamsWithReducedDepth,
+) {
+    let cache1 = mk_static(MemCache::new());
+    let cache2 = mk_static(MemCache::new());
+    run_(&run_params.get_reduced(), cache2).await;
+    assert_eq!(
+        line_occurences(&run_(run_params.get(), cache1).await),
+        line_occurences(&run_(run_params.get(), cache2).await)
+    );
+    cache1.clear();
+    cache2.clear();
 }
 
 async fn run_(params: &RunParams, cache: &'static MemCache<Url, Response>) -> Vec<u8> {
