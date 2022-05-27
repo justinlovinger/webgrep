@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 pub type NodeParent<T> = Option<Arc<Node<T>>>;
 
+#[derive(Debug)]
 pub struct Node<T> {
     depth: u64,
     parent: NodeParent<T>,

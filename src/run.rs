@@ -572,6 +572,7 @@ mod page {
         }
     }
 
+    #[derive(Debug)]
     pub struct Page {
         url: Url,
         body: Body,
