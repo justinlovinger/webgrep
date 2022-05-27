@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::num::NonZeroU16;
 use webgrep::client::{Body, Client, Response};
 
+#[derive(Debug)]
 pub struct PseudorandomClient {
     links_range: Uniform<u8>,
     domains_range: Uniform<u16>,
