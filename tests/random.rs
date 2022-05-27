@@ -71,7 +71,7 @@ impl Arbitrary for RunParams {
                 domains,
                 paths_per_domain,
             )),
-            page_threads: NonZeroUsize::arbitrary(g),
+            page_threads: NonZeroUsize::new(usize::arbitrary(g) % 16 + 1).unwrap(),
             exclude_urls_re: mk_static(None),
             max_depth: u64::arbitrary(g) % (MAX_MAX_DEPTH + 1),
             search_re: mk_static(Regex::new(".").unwrap()),
