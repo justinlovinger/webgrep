@@ -59,14 +59,27 @@ impl Arbitrary for RunParams {
     }
 }
 
-#[test]
-fn run_is_idempotent_with_empty_cache() {
-    assert!(true);
+#[quickcheck_async::tokio]
+async fn run_is_idempotent_with_empty_cache(run_params: RunParams) {
+    let cache1 = mk_static(MemCache::new());
+    let cache2 = mk_static(MemCache::new());
+    assert_eq!(
+        line_occurences(&run_(&run_params, cache1).await),
+        line_occurences(&run_(&run_params, cache2).await)
+    );
+    cache1.clear();
+    cache2.clear();
 }
 
-#[test]
-fn run_is_idempotent_with_full_cache() {
-    assert!(true);
+#[quickcheck_async::tokio]
+async fn run_is_idempotent_with_full_cache(run_params: RunParams) {
+    let cache = mk_static(MemCache::new());
+    run_(&run_params, cache).await;
+    assert_eq!(
+        line_occurences(&run_(&run_params, cache).await),
+        line_occurences(&run_(&run_params, cache).await)
+    );
+    cache.clear();
 }
 
 #[test]
@@ -81,7 +94,7 @@ async fn run_finds_the_same_matches_with_empty_or_full_cache(run_params: RunPara
         line_occurences(&run_(&run_params, cache).await),
         line_occurences(&run_(&run_params, cache).await)
     );
-    cache.clear(); // Static references won't automatically clear memory.
+    cache.clear();
 }
 
 #[test]
