@@ -1,13 +1,14 @@
 mod cache;
 mod client;
+mod common;
 
 use crate::cache::MemCache;
 use crate::client::{url_from_nums, PseudorandomClient};
+use crate::common::{line_occurences, mk_static};
 use core::str::FromStr;
 use quickcheck::{Arbitrary, Gen};
 use regex::Regex;
 use reqwest::Url;
-use std::collections::HashMap;
 use std::iter::repeat_with;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::time::Duration;
@@ -168,17 +169,4 @@ async fn run_(params: &RunParams, cache: &'static MemCache<Url, Response>) -> Ve
     .await
     .unwrap();
     buffer
-}
-
-fn mk_static<T>(x: T) -> &'static T {
-    Box::leak(Box::new(x))
-}
-
-fn line_occurences(buf: &[u8]) -> HashMap<&str, u32> {
-    let mut map = HashMap::new();
-    for line in std::str::from_utf8(&buf).unwrap().lines() {
-        let counter = map.entry(line).or_insert(0);
-        *counter += 1;
-    }
-    map
 }

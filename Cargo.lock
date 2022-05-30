@@ -1580,6 +1580,7 @@ dependencies = [
  "html5ever",
  "indicatif",
  "itertools",
+ "lazy_static",
  "markup5ever_rcdom",
  "num_cpus",
  "quickcheck",
