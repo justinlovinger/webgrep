@@ -22,7 +22,7 @@ impl<K: Hash, V> FileCache<K, V> {
                 Path::new(std::env::var("HOME")?.as_str()).join(".cache"),
                 PathBuf::from,
             )
-            .join("web-grep")
+            .join("webgrep")
             .join(name);
         tokio::fs::create_dir_all(&dir).await?;
         Ok(Self {
