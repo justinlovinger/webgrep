@@ -3,6 +3,11 @@ name = "webgrep"
 version = "0.1.0"
 authors = ["Justin Lovinger"]
 description = "Recursively search the web, starting from URL..., for PATTERN"
+readme = "README.md"
+homepage = "https://github.com/JustinLovinger/webgrep"
+repository = "https://github.com/JustinLovinger/webgrep"
+keywords = ["regex", "grep", "search", "pattern", "web"]
+categories = ["command-line-utilities"]
 license = "MIT"
 
 edition = "2021"
